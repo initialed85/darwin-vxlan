@@ -1,0 +1,22 @@
+[package]
+name = "darwin-vxlan"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+# Replaces vmnet.framework with a pure-C stub (real pipes, no hardware).
+# Used for `cargo test` and coverage — never enable in production builds.
+vmnet-mock = []
+
+[dependencies]
+clap = { version = "4.6", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "sync", "time", "signal"] }
+anyhow = "1.0"
+
+[build-dependencies]
+cc = "1.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
