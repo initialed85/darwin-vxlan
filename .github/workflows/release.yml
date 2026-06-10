@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g., 0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_VERSION: 'stable'
+
+jobs:
+  build:
+    name: Build ARM64
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Build release binary
+        run: cargo build --release --target aarch64-apple-darwin
+
+      - name: Verify architecture
+        run: |
+          file target/aarch64-apple-darwin/release/darwin-vxlan | grep -q "arm64" || {
+            echo "ERROR: Binary is not ARM64"
+            exit 1
+          }
+
+      - name: Create tarball
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          
+          mkdir -p dist
+          cp target/aarch64-apple-darwin/release/darwin-vxlan dist/
+          cp README.md dist/ || true
+          
+          cd dist
+          tar -czf darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan README.md
+          cd ..
+          
+          echo "==> Created tarball:"
+          ls -lh dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball
+          path: dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
+          retention-days: 1
+
+  package:
+    name: Create .pkg
+    needs: build
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download tarball artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: dist/
+
+      - name: Extract binary from tarball
+        run: |
+          cd dist
+          tar -xzf darwin-vxlan-aarch64-apple-darwin.tar.gz
+          ls -la
+
+      - name: Make build script executable
+        run: chmod +x scripts/build-pkg.sh
+
+      - name: Build .pkg
+        run: |
+          ./scripts/build-pkg.sh \
+            dist/darwin-vxlan \
+            ${{ env.VERSION }} \
+            dist/
+
+      - name: Upload .pkg artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg
+          path: dist/*.pkg
+          retention-days: 1
+
+  release:
+    name: Create GitHub Release
+    needs: [build, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download tarball artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: tarball
+          path: dist/
+
+      - name: Download .pkg artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: pkg
+          path: dist/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan-*.pkg > sha256sums.txt
+          echo "==> Checksums:"
+          cat sha256sums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: darwin-vxlan v${{ env.VERSION }}
+          body: |
+            ## Installation
+            
+            ### Via Homebrew (coming soon)
+            ```bash
+            brew install cyborgside/tap/darwin-vxlan
+            ```
+            
+            ### Manual installation
+            ```bash
+            # Download and extract
+            curl -L https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz
+            
+            # Move to PATH
+            sudo mv darwin-vxlan /usr/local/bin/
+            
+            # Allow execution (Gatekeeper)
+            xattr -d com.apple.quarantine /usr/local/bin/darwin-vxlan
+            
+            # Verify
+            darwin-vxlan --help
+            ```
+            
+            ### Using the .pkg installer
+            ```bash
+            # Download the .pkg
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/darwin-vxlan-${{ env.VERSION }}.pkg
+            
+            # Install (requires sudo)
+            sudo installer -pkg darwin-vxlan-${{ env.VERSION }}.pkg -target /
+            ```
+            
+            ### Checksums
+            See `sha256sums.txt` for verification.
+          files: |
+            dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
+            dist/darwin-vxlan-*.pkg
+            dist/sha256sums.txt
+          draft: false
+          prerelease: false
+          generate_release_notes: true
