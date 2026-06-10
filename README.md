@@ -38,6 +38,37 @@ cargo build --release
 
 The build script compiles `src/vmnet_bridge.c` and links `vmnet.framework` automatically.
 
+## Installation
+
+### Via Homebrew (coming soon)
+```bash
+brew install cyborgside/tap/darwin-vxlan
+```
+
+### Manual installation
+```bash
+# Download the latest release
+curl -L https://github.com/cyborgside/darwin-vxlan/releases/latest/download/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz
+
+# Move to PATH
+sudo mv darwin-vxlan /usr/local/bin/
+
+# Allow execution (Gatekeeper)
+xattr -d com.apple.quarantine /usr/local/bin/darwin-vxlan
+
+# Verify
+darwin-vxlan --help
+```
+
+### Using the .pkg installer
+```bash
+# Download the latest .pkg
+curl -LO https://github.com/cyborgside/darwin-vxlan/releases/latest/download/darwin-vxlan-*.pkg
+
+# Install (requires sudo)
+sudo installer -pkg darwin-vxlan-*.pkg -target /
+```
+
 ## Usage
 
 ```
