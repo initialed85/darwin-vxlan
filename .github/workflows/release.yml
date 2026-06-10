@@ -11,6 +11,12 @@ on:
         required: true
         type: string
 
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: 'stable'
@@ -45,15 +51,15 @@ jobs:
             VERSION="${{ inputs.version }}"
           fi
           echo "VERSION=${VERSION}" >> $GITHUB_ENV
-          
+
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/darwin-vxlan dist/
           cp README.md dist/ || true
-          
+
           cd dist
           tar -czf darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan README.md
           cd ..
-          
+
           echo "==> Created tarball:"
           ls -lh dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
 
@@ -62,7 +68,7 @@ jobs:
         with:
           name: tarball
           path: dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
-          retention-days: 1
+          retention-days: 3
 
   package:
     name: Create .pkg
@@ -77,6 +83,14 @@ jobs:
         with:
           name: tarball
           path: dist/
+
+      - name: Derive VERSION
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
 
       - name: Extract binary from tarball
         run: |
@@ -99,7 +113,7 @@ jobs:
         with:
           name: pkg
           path: dist/*.pkg
-          retention-days: 1
+          retention-days: 3
 
   release:
     name: Create GitHub Release
@@ -120,6 +134,14 @@ jobs:
           name: pkg
           path: dist/
 
+      - name: Derive VERSION
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$VERSION" ]; then
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+
       - name: Generate checksums
         run: |
           cd dist
@@ -128,41 +150,41 @@ jobs:
           cat sha256sums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a74c6b72af54cff07e0e28e3c8f2bcbc248f0901
         with:
           name: darwin-vxlan v${{ env.VERSION }}
           body: |
             ## Installation
-            
+
             ### Via Homebrew (coming soon)
             ```bash
             brew install cyborgside/tap/darwin-vxlan
             ```
-            
+
             ### Manual installation
             ```bash
             # Download and extract
             curl -L https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz
-            
+
             # Move to PATH
             sudo mv darwin-vxlan /usr/local/bin/
-            
+
             # Allow execution (Gatekeeper)
             xattr -d com.apple.quarantine /usr/local/bin/darwin-vxlan
-            
+
             # Verify
             darwin-vxlan --help
             ```
-            
+
             ### Using the .pkg installer
             ```bash
             # Download the .pkg
             curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/darwin-vxlan-${{ env.VERSION }}.pkg
-            
+
             # Install (requires sudo)
             sudo installer -pkg darwin-vxlan-${{ env.VERSION }}.pkg -target /
             ```
-            
+
             ### Checksums
             See `sha256sums.txt` for verification.
           files: |
