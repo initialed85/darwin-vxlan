@@ -150,7 +150,7 @@ jobs:
           cat sha256sums.txt
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@a74c6b72af54cff07e0e28e3c8f2bcbc248f0901
+        uses: softprops/action-gh-release@v3
         with:
           name: darwin-vxlan v${{ env.VERSION }}
           body: |
