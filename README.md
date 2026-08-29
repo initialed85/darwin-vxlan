@@ -85,6 +85,26 @@ darwin-vxlan --vni <VNI> --local <IP> --remote <IP> [OPTIONS]
 | `--bridge-ipv4` | — | IPv4 CIDR to assign to the bridge (e.g. `192.168.100.1/24`) |
 | `--bridge-ipv6` | — | IPv6 CIDR to assign to the bridge (e.g. `fd00::1/64`) |
 
+### Bridge naming
+
+macOS/vmnet does not expose a supported API for choosing the host-mode
+interface name. This experiment works around that by reserving the unused
+bridge units between `bridge100` and the requested VNI before starting vmnet.
+As a result:
+
+```text
+--vni 199  ->  bridge199
+--vni 137  ->  bridge137
+```
+
+The temporary bridge devices are destroyed after vmnet starts. The requested
+bridge must not already exist, and bridge allocation must not race another
+program creating a bridge. This requires the same privileges as vmnet (run as
+root or use the vmnet entitlement). VNIs below 100 cannot be numbered this
+way because vmnet host-mode allocation starts at `bridge100` on the systems
+this experiment targets. The current allocator hack also refuses VNIs above
+4095 rather than creating thousands of temporary bridge devices.
+
 ### Example: point-to-point tunnel between two macOS hosts
 
 **Host A** (`10.0.0.1`):

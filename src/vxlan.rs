@@ -2,6 +2,17 @@ use anyhow::Result;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+
+const VXLAN_MAX_VNI: u32 = 0x00ff_ffff;
+/// vmnet's host-mode bridge allocator starts at bridge100 on macOS. Keeping
+/// every lower unit occupied makes the next vmnet bridge deterministic.
+#[cfg(not(feature = "vmnet-mock"))]
+const VMNET_BRIDGE_BASE: u32 = 100;
+/// Creating thousands of temporary bridge devices is a bad failure mode for a
+/// naming convenience. Raise this only if the allocator hack proves useful
+/// beyond the small VNIs used by this experiment.
+#[cfg(not(feature = "vmnet-mock"))]
+const VMNET_MAX_FORCED_VNI: u32 = 4095;
 use std::time::Duration;
 
 const VXLAN_HEADER_SIZE: usize = 8;
@@ -56,6 +67,119 @@ impl Drop for VxlanTunnel {
     }
 }
 
+/// Cleans up a vmnet context if construction fails after vmnet_start succeeds.
+/// The old code leaked the context on bridge/address setup errors; this guard
+/// also matters now that bridge-number reservations can fail part-way through.
+struct VmnetContextGuard {
+    ctx: *mut libc::c_void,
+}
+
+impl VmnetContextGuard {
+    fn new(ctx: *mut libc::c_void) -> Self {
+        Self { ctx }
+    }
+
+    fn disarm(&mut self) {
+        self.ctx = std::ptr::null_mut();
+    }
+}
+
+impl Drop for VmnetContextGuard {
+    fn drop(&mut self) {
+        if !self.ctx.is_null() {
+            unsafe { vmnet_ctx_stop(self.ctx); }
+        }
+    }
+}
+
+struct BridgeReservations {
+    names: Vec<String>,
+}
+
+impl BridgeReservations {
+    fn empty() -> Self {
+        Self { names: Vec::new() }
+    }
+}
+
+impl Drop for BridgeReservations {
+    fn drop(&mut self) {
+        for name in self.names.drain(..).rev() {
+            let status = std::process::Command::new("ifconfig")
+                .args([&name, "destroy"])
+                .status();
+            match status {
+                Ok(status) if status.success() => {}
+                Ok(status) => tracing::warn!(
+                    "failed to destroy temporary bridge {} (exit {})",
+                    name,
+                    status
+                ),
+                Err(error) => tracing::warn!(
+                    "failed to destroy temporary bridge {}: {}",
+                    name,
+                    error
+                ),
+            }
+        }
+    }
+}
+
+fn bridge_name_for_vni(vni: u32) -> Result<String> {
+    if vni > VXLAN_MAX_VNI {
+        anyhow::bail!("VNI {} is outside the 24-bit VXLAN range", vni);
+    }
+    Ok(format!("bridge{}", vni))
+}
+
+/// Reserve bridge units below the requested VNI. vmnet.framework does not
+/// provide an interface-name parameter; on macOS host-mode vmnet allocates
+/// bridge units starting at bridge100. Occupying the lower units causes the
+/// next allocation to be bridge<VNI>.
+#[cfg(not(feature = "vmnet-mock"))]
+fn reserve_bridge_units(vni: u32) -> Result<BridgeReservations> {
+    if vni < VMNET_BRIDGE_BASE {
+        anyhow::bail!(
+            "cannot force bridge{}: vmnet host-mode bridge allocation starts at bridge{}",
+            vni,
+            VMNET_BRIDGE_BASE
+        );
+    }
+    if vni > VMNET_MAX_FORCED_VNI {
+        anyhow::bail!(
+            "cannot force bridge{}: refusing to create more than {} temporary bridge devices",
+            vni,
+            VMNET_MAX_FORCED_VNI - VMNET_BRIDGE_BASE
+        );
+    }
+
+    let desired = bridge_name_for_vni(vni)?;
+    let existing = list_bridge_interfaces();
+    if existing.iter().any(|name| name == &desired) {
+        anyhow::bail!(
+            "{} already exists; refusing to use or disturb an existing bridge",
+            desired
+        );
+    }
+
+    let mut reservations = BridgeReservations::empty();
+    for unit in VMNET_BRIDGE_BASE..vni {
+        let name = format!("bridge{}", unit);
+        if existing.iter().any(|current| current == &name) {
+            continue;
+        }
+        let status = std::process::Command::new("ifconfig")
+            .args([&name, "create"])
+            .status()
+            .map_err(|error| anyhow::anyhow!("create temporary {}: {}", name, error))?;
+        if !status.success() {
+            anyhow::bail!("failed to create temporary {} (exit {})", name, status);
+        }
+        reservations.names.push(name);
+    }
+    Ok(reservations)
+}
+
 // ---------------------------------------------------------------------------
 // Test helpers (mock build only)
 // ---------------------------------------------------------------------------
@@ -83,9 +207,22 @@ impl VxlanTunnel {
         bridge_ipv4: Option<&str>,
         bridge_ipv6: Option<&str>,
     ) -> Result<Self> {
+        let desired_bridge = bridge_name_for_vni(vni)?;
         let socket = UdpSocket::bind(SocketAddr::new(local, port)).await
             .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket: {}", e))?;
         let remote_addr = SocketAddr::new(remote, port);
+        #[cfg(feature = "vmnet-mock")]
+        let _ = &desired_bridge;
+
+        // macOS does not expose a supported vmnet option for choosing the
+        // bridge name. Reserve the lower bridge units so vmnet's next
+        // automatically-created interface is bridge<VNI>. This is deliberately
+        // a small experiment-specific hack; reservations are removed on every
+        // exit path by BridgeReservations' Drop implementation.
+        #[cfg(not(feature = "vmnet-mock"))]
+        let _bridge_reservations = reserve_bridge_units(vni)?;
+        #[cfg(feature = "vmnet-mock")]
+        let _bridge_reservations = BridgeReservations::empty();
 
         let bridges_before = list_bridge_interfaces();
 
@@ -96,6 +233,7 @@ impl VxlanTunnel {
                  vmnet.framework requires root or the com.apple.vm.networking entitlement."
             );
         }
+        let mut ctx_guard = VmnetContextGuard::new(ctx);
 
         let (notify_fd, shutdown_write_fd, shutdown_read_fd, max_pkt, vmnet_mtu) = unsafe {(
             vmnet_ctx_notify_fd(ctx),
@@ -107,6 +245,14 @@ impl VxlanTunnel {
 
         // Retry until macOS registers the new bridge (up to 3 s).
         let bridge = wait_for_new_bridge(&bridges_before)?;
+
+        #[cfg(not(feature = "vmnet-mock"))]
+        if bridge != desired_bridge {
+            anyhow::bail!(
+                "vmnet created {}, expected {} for VNI {}; another interface may have raced the bridge allocator",
+                bridge, desired_bridge, vni
+            );
+        }
 
         // Remove the IPv4 that vmnet auto-assigns.
         remove_all_inet4(&bridge);
@@ -128,7 +274,7 @@ impl VxlanTunnel {
             local, remote, port, vni
         );
 
-        Ok(Self {
+        let tunnel = Self {
             vni,
             remote_addr,
             socket: Arc::new(socket),
@@ -138,7 +284,9 @@ impl VxlanTunnel {
             shutdown_read_fd,
             max_packet_size: max_pkt,
             bridge_name: bridge,
-        })
+        };
+        ctx_guard.disarm();
+        Ok(tunnel)
     }
 }
 
@@ -532,6 +680,25 @@ mod tests {
     fn vxlan_to_vmnet_vni_mismatch_returns_early() {
         let frame = make_frame(10, &[0xAA; 14]);
         vxlan_to_vmnet(&frame, 99, std::ptr::null_mut(), "bridge0");
+    }
+
+    // -----------------------------------------------------------------------
+    // bridge naming
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bridge_name_matches_vni() {
+        assert_eq!(bridge_name_for_vni(199).unwrap(), "bridge199");
+    }
+
+    #[test]
+    fn bridge_name_accepts_maximum_vni() {
+        assert_eq!(bridge_name_for_vni(VXLAN_MAX_VNI).unwrap(), "bridge16777215");
+    }
+
+    #[test]
+    fn bridge_name_rejects_vni_above_vxlan_range() {
+        assert!(bridge_name_for_vni(VXLAN_MAX_VNI + 1).is_err());
     }
 
     // -----------------------------------------------------------------------
