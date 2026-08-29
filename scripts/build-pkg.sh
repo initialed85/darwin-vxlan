@@ -7,7 +7,7 @@ set -euo pipefail
 BINARY_PATH="${1:-target/release/darwin-vxlan}"
 VERSION="${2:-$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 OUTPUT_DIR="${3:-dist}"
-IDENTIFIER="com.cyborgside.darwin-vxlan"
+IDENTIFIER="com.initialed85.darwin-vxlan"
 PACKAGE_NAME="darwin-vxlan"
 
 echo "==> Building .pkg for ${PACKAGE_NAME} v${VERSION}"

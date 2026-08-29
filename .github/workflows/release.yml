@@ -11,7 +11,8 @@ on:
         required: true
         type: string
 
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -20,6 +21,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_VERSION: 'stable'
+  VERSION_INPUT: ${{ inputs.version }}
 
 jobs:
   build:
@@ -46,11 +48,17 @@ jobs:
 
       - name: Create tarball
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [ -z "$VERSION" ]; then
-            VERSION="${{ inputs.version }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            VERSION="$VERSION_INPUT"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
           fi
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          VERSION="${VERSION#v}"
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Could not determine release version"
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
           mkdir -p dist
           cp target/aarch64-apple-darwin/release/darwin-vxlan dist/
@@ -86,11 +94,17 @@ jobs:
 
       - name: Derive VERSION
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [ -z "$VERSION" ]; then
-            VERSION="${{ inputs.version }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            VERSION="$VERSION_INPUT"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
           fi
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          VERSION="${VERSION#v}"
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Could not determine release version"
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Extract binary from tarball
         run: |
@@ -136,11 +150,17 @@ jobs:
 
       - name: Derive VERSION
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          if [ -z "$VERSION" ]; then
-            VERSION="${{ inputs.version }}"
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            VERSION="$VERSION_INPUT"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
           fi
-          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+          VERSION="${VERSION#v}"
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Could not determine release version"
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
       - name: Generate checksums
         run: |
@@ -152,14 +172,13 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: v${{ env.VERSION }}
           name: darwin-vxlan v${{ env.VERSION }}
           body: |
             ## Installation
 
-            ### Via Homebrew (coming soon)
-            ```bash
-            brew install cyborgside/tap/darwin-vxlan
-            ```
+            ### Via Homebrew
+            A Homebrew formula is not currently published for this fork.
 
             ### Manual installation
             ```bash

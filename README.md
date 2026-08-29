@@ -40,15 +40,13 @@ The build script compiles `src/vmnet_bridge.c` and links `vmnet.framework` autom
 
 ## Installation
 
-### Via Homebrew (coming soon)
-```bash
-brew install cyborgside/tap/darwin-vxlan
-```
+### Via Homebrew
+A Homebrew formula is not currently published for this fork.
 
 ### Manual installation
 ```bash
 # Download the latest release
-curl -L https://github.com/cyborgside/darwin-vxlan/releases/latest/download/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz
+curl -L https://github.com/initialed85/darwin-vxlan/releases/latest/download/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz
 
 # Move to PATH
 sudo mv darwin-vxlan /usr/local/bin/
@@ -62,12 +60,27 @@ darwin-vxlan --help
 
 ### Using the .pkg installer
 ```bash
-# Download the latest .pkg
-curl -LO https://github.com/cyborgside/darwin-vxlan/releases/latest/download/darwin-vxlan-*.pkg
+# Set this to the release version you want to install.
+VERSION=0.1.0
+curl -LO "https://github.com/initialed85/darwin-vxlan/releases/download/v${VERSION}/darwin-vxlan-${VERSION}.pkg"
 
 # Install (requires sudo)
-sudo installer -pkg darwin-vxlan-*.pkg -target /
+sudo installer -pkg "darwin-vxlan-${VERSION}.pkg" -target /
 ```
+
+## Releases
+
+The release workflow builds the Apple Silicon tarball and `.pkg` installer when a
+`v*` tag is pushed. To publish a release from this fork:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+A release can also be started manually from the **Release** workflow by
+supplying a version such as `0.1.0`; the workflow creates the corresponding
+`v0.1.0` release tag.
 
 ## Usage
 
@@ -117,7 +130,7 @@ sudo darwin-vxlan --vni 100 --local 10.0.0.1 --remote 10.0.0.2 --bridge-ipv4 192
 sudo darwin-vxlan --vni 100 --local 10.0.0.2 --remote 10.0.0.1 --bridge-ipv4 192.168.100.2/24
 ```
 
-Both sides will have a `bridge` interface with the assigned address. Traffic sent to `192.168.100.0/24` is encapsulated in VXLAN and forwarded over UDP between the two hosts.
+With `--vni 100`, both sides will have a `bridge100` interface with the assigned address. Traffic sent to `192.168.100.0/24` is encapsulated in VXLAN and forwarded over UDP between the two hosts.
 
 Press `Ctrl+C` to shut down.
 
