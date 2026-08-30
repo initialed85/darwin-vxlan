@@ -85,7 +85,7 @@ supplying a version such as `0.1.0`; the workflow creates the corresponding
 ## Usage
 
 ```
-darwin-vxlan --vni <VNI> --local <IP> (--remote <IP>... | --peer <POD_CIDR=UNDERLAY_IP>...) [OPTIONS]
+darwin-vxlan --vni <VNI> --local <IP> (--remote <IP>... | --peer <POD_CIDR=UNDERLAY_IP[,VTEP_MAC]>...) [OPTIONS]
 ```
 
 | Flag | Default | Description |
@@ -93,7 +93,7 @@ darwin-vxlan --vni <VNI> --local <IP> (--remote <IP>... | --peer <POD_CIDR=UNDER
 | `--vni` | _(required)_ | VXLAN Network Identifier |
 | `--local` | _(required)_ | Local IP address for the VXLAN UDP socket |
 | `--remote` | _(one of `--remote`/`--peer` required)_ | Unmapped remote VTEP IP fallback; repeat (or comma-separate) for each peer |
-| `--peer` | _(one of `--remote`/`--peer` required)_ | Destination mapping in `POD_CIDR=UNDERLAY_IP` form; repeat for each mapped VTEP |
+| `--peer` | _(one of `--remote`/`--peer` required)_ | Destination mapping in `POD_CIDR=UNDERLAY_IP[,VTEP_MAC]` form; repeat for each mapped VTEP |
 | `--port` | `4789` | UDP port used for the local VXLAN listen/bind and every remote destination; use `8472` for K3s Flannel |
 | `--mtu` | `1450` | MTU for the bridge interface |
 | `--bridge-ipv4` | — | IPv4 CIDR to assign to the bridge (e.g. `192.168.100.1/24`) |
@@ -165,12 +165,13 @@ allocator-selected bridge name because host-mode bridge numbering starts at
 
 A process owns one local UDP bind and can select a destination-specific VTEP
 for each known unicast Ethernet frame. Pass mapped peers as repeated
-`--peer POD_CIDR=UNDERLAY_IP` options; the helper selects a peer from the
-inner IPv4/IPv6 destination CIDR. Maclet should install a per-PodCIDR
-synthetic gateway and static ARP entry so the inner destination MAC is also
-the corresponding Flannel VTEP MAC. The inner Ethernet frame is never
-rewritten. The API additionally accepts an optional VTEP MAC selector for
-callers that already have an FDB mapping. Broadcast, multicast, unknown-
+`--peer POD_CIDR=UNDERLAY_IP[,VTEP_MAC]` options; the helper selects a peer
+from the inner destination MAC first, then from the longest matching inner
+IPv4/IPv6/ARP destination CIDR. The legacy `--peer UNDERLAY_IP,VTEP_MAC`
+form is also accepted when only MAC-based selection is needed. Maclet should
+install a per-PodCIDR synthetic gateway and static ARP entry so the inner
+destination MAC is the corresponding Flannel VTEP MAC. The inner Ethernet
+frame is never rewritten. Broadcast, multicast, unknown-
 unicast, short, and legacy unmapped frames use the all-peer fallback. Use
 repeated `--remote` options for that fallback, or use `--remote` alongside
 `--peer` to add additional unmapped fallback destinations. Incoming VXLAN

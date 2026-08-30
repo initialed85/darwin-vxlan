@@ -36,8 +36,7 @@ impl IpCidr {
                 if prefix == 0 {
                     true
                 } else {
-                    u32::from(network) >> (32 - prefix)
-                        == u32::from(address) >> (32 - prefix)
+                    u32::from(network) >> (32 - prefix) == u32::from(address) >> (32 - prefix)
                 }
             }
             (IpAddr::V6(network), IpAddr::V6(address)) => {
@@ -48,8 +47,7 @@ impl IpCidr {
                 if prefix == 0 {
                     true
                 } else {
-                    u128::from(network) >> (128 - prefix)
-                        == u128::from(address) >> (128 - prefix)
+                    u128::from(network) >> (128 - prefix) == u128::from(address) >> (128 - prefix)
                 }
             }
             _ => false,
@@ -97,7 +95,10 @@ impl FromStr for IpCidr {
                 IpAddr::V6(Ipv6Addr::from(bits & mask))
             }
         };
-        Ok(Self { network, prefix_len })
+        Ok(Self {
+            network,
+            prefix_len,
+        })
     }
 }
 
@@ -126,7 +127,6 @@ unsafe extern "C" {
     fn vmnet_ctx_write(ctx: *mut libc::c_void, buf: *const u8, len: libc::size_t) -> libc::c_int;
     fn vmnet_ctx_stop(ctx: *mut libc::c_void);
 }
-
 
 #[cfg(feature = "vmnet-mock")]
 unsafe extern "C" {
@@ -157,7 +157,9 @@ unsafe impl Sync for VxlanTunnel {}
 
 impl Drop for VxlanTunnel {
     fn drop(&mut self) {
-        unsafe { vmnet_ctx_stop(self.ctx); }
+        unsafe {
+            vmnet_ctx_stop(self.ctx);
+        }
     }
 }
 
@@ -181,7 +183,9 @@ impl VmnetContextGuard {
 impl Drop for VmnetContextGuard {
     fn drop(&mut self) {
         if !self.ctx.is_null() {
-            unsafe { vmnet_ctx_stop(self.ctx); }
+            unsafe {
+                vmnet_ctx_stop(self.ctx);
+            }
         }
     }
 }
@@ -209,11 +213,9 @@ impl Drop for BridgeReservations {
                     name,
                     status
                 ),
-                Err(error) => tracing::warn!(
-                    "failed to destroy temporary bridge {}: {}",
-                    name,
-                    error
-                ),
+                Err(error) => {
+                    tracing::warn!("failed to destroy temporary bridge {}: {}", name, error)
+                }
             }
         }
     }
@@ -308,7 +310,8 @@ impl VxlanTunnel {
             mtu,
             bridge_ipv4,
             bridge_ipv6,
-        ).await
+        )
+        .await
     }
 
     /// Construct a tunnel with one local UDP socket and one or more remote
@@ -322,7 +325,8 @@ impl VxlanTunnel {
         bridge_ipv4: Option<&str>,
         bridge_ipv6: Option<&str>,
     ) -> Result<Self> {
-        let peers = remote_addrs.into_iter()
+        let peers = remote_addrs
+            .into_iter()
             .map(|endpoint| VtepPeer {
                 endpoint,
                 pod_cidr: None,
@@ -349,7 +353,8 @@ impl VxlanTunnel {
         }
 
         let desired_bridge = bridge_name_for_vni(vni)?;
-        let socket = UdpSocket::bind(local_addr).await
+        let socket = UdpSocket::bind(local_addr)
+            .await
             .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket: {}", e))?;
         #[cfg(feature = "vmnet-mock")]
         let _ = &desired_bridge;
@@ -375,13 +380,15 @@ impl VxlanTunnel {
         }
         let mut ctx_guard = VmnetContextGuard::new(ctx);
 
-        let (notify_fd, shutdown_write_fd, shutdown_read_fd, max_pkt, vmnet_mtu) = unsafe {(
-            vmnet_ctx_notify_fd(ctx),
-            vmnet_ctx_shutdown_write_fd(ctx),
-            vmnet_ctx_shutdown_read_fd(ctx),
-            vmnet_ctx_max_packet_size(ctx),
-            vmnet_ctx_mtu(ctx),
-        )};
+        let (notify_fd, shutdown_write_fd, shutdown_read_fd, max_pkt, vmnet_mtu) = unsafe {
+            (
+                vmnet_ctx_notify_fd(ctx),
+                vmnet_ctx_shutdown_write_fd(ctx),
+                vmnet_ctx_shutdown_read_fd(ctx),
+                vmnet_ctx_max_packet_size(ctx),
+                vmnet_ctx_mtu(ctx),
+            )
+        };
 
         // Retry until macOS registers the new bridge (up to 3 s).
         let bridge = wait_for_new_bridge(&bridges_before)?;
@@ -390,7 +397,9 @@ impl VxlanTunnel {
         if vni >= VMNET_BRIDGE_BASE && bridge != desired_bridge {
             anyhow::bail!(
                 "vmnet created {}, expected {} for VNI {}; another interface may have raced the bridge allocator",
-                bridge, desired_bridge, vni
+                bridge,
+                desired_bridge,
+                vni
             );
         }
 
@@ -407,11 +416,15 @@ impl VxlanTunnel {
 
         tracing::info!(
             "vmnet bridge: {} | mtu={} | max_pkt={}",
-            bridge, vmnet_mtu, max_pkt
+            bridge,
+            vmnet_mtu,
+            max_pkt
         );
         tracing::info!(
             "VXLAN ready: local={} peers={:?} vni={}",
-            local_addr, peers, vni
+            local_addr,
+            peers,
+            vni
         );
 
         let tunnel = Self {
@@ -443,17 +456,17 @@ impl VxlanTunnel {
     where
         F: std::future::Future<Output = std::io::Result<()>>,
     {
-        let vni               = self.vni;
-        let peers              = self.peers.clone();
-        let notify_fd         = self.notify_fd;
+        let vni = self.vni;
+        let peers = self.peers.clone();
+        let notify_fd = self.notify_fd;
         let shutdown_write_fd = self.shutdown_write_fd;
-        let shutdown_read_fd  = self.shutdown_read_fd;
-        let max_pkt           = self.max_packet_size;
-        let ctx_read          = self.ctx as usize; // usize is Send; recast inside thread
-        let ctx_write         = self.ctx as usize;
-        let socket_tx         = self.socket.clone();
-        let socket_rx         = self.socket.clone();
-        let bridge_name       = self.bridge_name.clone();
+        let shutdown_read_fd = self.shutdown_read_fd;
+        let max_pkt = self.max_packet_size;
+        let ctx_read = self.ctx as usize; // usize is Send; recast inside thread
+        let ctx_write = self.ctx as usize;
+        let socket_tx = self.socket.clone();
+        let socket_rx = self.socket.clone();
+        let bridge_name = self.bridge_name.clone();
 
         let (eth_tx, mut eth_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         // The forwarding tasks must stop before VxlanTunnel is dropped. In
@@ -467,23 +480,39 @@ impl VxlanTunnel {
             let mut buf = vec![0u8; max_pkt];
             loop {
                 let mut pfds = [
-                    libc::pollfd { fd: notify_fd,        events: libc::POLLIN, revents: 0 },
-                    libc::pollfd { fd: shutdown_read_fd, events: libc::POLLIN, revents: 0 },
+                    libc::pollfd {
+                        fd: notify_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: shutdown_read_fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
                 ];
-                if unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) } <= 0 { break; }
+                if unsafe { libc::poll(pfds.as_mut_ptr(), 2, -1) } <= 0 {
+                    break;
+                }
 
                 // Shutdown fd readable → exit cleanly.
-                if pfds[1].revents & libc::POLLIN != 0 { break; }
+                if pfds[1].revents & libc::POLLIN != 0 {
+                    break;
+                }
 
                 // Drain notification pipe.
                 let mut drain = [0u8; 256];
                 loop {
                     let r = unsafe {
-                        libc::read(notify_fd,
+                        libc::read(
+                            notify_fd,
                             drain.as_mut_ptr() as *mut libc::c_void,
-                            drain.len() as libc::size_t)
+                            drain.len() as libc::size_t,
+                        )
                     };
-                    if r <= 0 { break; }
+                    if r <= 0 {
+                        break;
+                    }
                 }
 
                 // Read all available frames.
@@ -491,9 +520,13 @@ impl VxlanTunnel {
                     let n = unsafe {
                         vmnet_ctx_read_one(ctx, buf.as_mut_ptr(), buf.len() as libc::size_t)
                     };
-                    if n <= 0 { break; }
+                    if n <= 0 {
+                        break;
+                    }
                     let frame = buf[..n as usize].to_vec();
-                    if eth_tx.send(frame).is_err() { return; }
+                    if eth_tx.send(frame).is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -553,7 +586,9 @@ impl VxlanTunnel {
         let _ = shutdown_tx.send(true);
 
         // Unblock the poll loop in the blocking thread so the runtime can finish.
-        unsafe { libc::write(shutdown_write_fd, [1u8].as_ptr() as *const libc::c_void, 1); }
+        unsafe {
+            libc::write(shutdown_write_fd, [1u8].as_ptr() as *const libc::c_void, 1);
+        }
         let _ = blocking_handle.await;
         let _ = tx_handle.await;
         let _ = rx_handle.await;
@@ -578,8 +613,8 @@ fn build_vxlan_payload(eth: &[u8], vni: u32) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(VXLAN_HEADER_SIZE + eth.len());
     let vni_be = vni.to_be_bytes(); // [0, hi, mid, lo]
     pkt.extend_from_slice(&[0x08, 0x00, 0x00, 0x00]); // flags: I-bit set, reserved
-    pkt.extend_from_slice(&vni_be[1..]);               // 3-byte VNI (big-endian)
-    pkt.push(0x00);                                     // reserved
+    pkt.extend_from_slice(&vni_be[1..]); // 3-byte VNI (big-endian)
+    pkt.push(0x00); // reserved
     pkt.extend_from_slice(eth);
     pkt
 }
@@ -591,9 +626,7 @@ fn build_vxlan_payload(eth: &[u8], vni: u32) -> Vec<u8> {
 /// peers without mappings intentionally use the all-peer fallback. The
 /// caller still sends the original Ethernet payload unchanged.
 fn select_peer_endpoints(eth: &[u8], peers: &[VtepPeer]) -> Vec<SocketAddr> {
-    let destination_mac: Option<[u8; 6]> = eth
-        .get(..6)
-        .and_then(|bytes| bytes.try_into().ok());
+    let destination_mac: Option<[u8; 6]> = eth.get(..6).and_then(|bytes| bytes.try_into().ok());
     if destination_mac.is_none_or(|mac| mac[0] & 1 != 0) {
         return unique_peer_endpoints(peers);
     }
@@ -636,20 +669,16 @@ fn inner_destination_ip(eth: &[u8]) -> Option<IpAddr> {
     }
     let ether_type = u16::from_be_bytes([eth[12], eth[13]]);
     match ether_type {
-        0x0800 if eth.len() >= 34 && eth[14] >> 4 == 4 => {
-            Some(IpAddr::V4(Ipv4Addr::new(eth[30], eth[31], eth[32], eth[33])))
-        }
-        0x0806 if eth.len() >= 42 => {
-            Some(IpAddr::V4(Ipv4Addr::new(eth[38], eth[39], eth[40], eth[41])))
-        }
-        0x86DD if eth.len() >= 54 && eth[14] >> 4 == 6 => {
-            Some(IpAddr::V6(Ipv6Addr::from([
-                eth[38], eth[39], eth[40], eth[41],
-                eth[42], eth[43], eth[44], eth[45],
-                eth[46], eth[47], eth[48], eth[49],
-                eth[50], eth[51], eth[52], eth[53],
-            ])))
-        }
+        0x0800 if eth.len() >= 34 && eth[14] >> 4 == 4 => Some(IpAddr::V4(Ipv4Addr::new(
+            eth[30], eth[31], eth[32], eth[33],
+        ))),
+        0x0806 if eth.len() >= 42 => Some(IpAddr::V4(Ipv4Addr::new(
+            eth[38], eth[39], eth[40], eth[41],
+        ))),
+        0x86DD if eth.len() >= 54 && eth[14] >> 4 == 6 => Some(IpAddr::V6(Ipv6Addr::from([
+            eth[38], eth[39], eth[40], eth[41], eth[42], eth[43], eth[44], eth[45], eth[46],
+            eth[47], eth[48], eth[49], eth[50], eth[51], eth[52], eth[53],
+        ]))),
         _ => None,
     }
 }
@@ -668,7 +697,9 @@ fn unique_peer_endpoints_refs(peers: Vec<&VtepPeer>) -> Vec<SocketAddr> {
 
 /// Strip the VXLAN header and inject the inner Ethernet frame into vmnet.
 fn vxlan_to_vmnet(frame: &[u8], vni: u32, ctx: *mut libc::c_void, bridge: &str) {
-    let Some(eth) = unwrap_vxlan(frame, vni) else { return };
+    let Some(eth) = unwrap_vxlan(frame, vni) else {
+        return;
+    };
     let ret = unsafe { vmnet_ctx_write(ctx, eth.as_ptr(), eth.len() as libc::size_t) };
     if ret < 0 {
         tracing::warn!("vmnet_write to {} failed", bridge);
@@ -694,17 +725,26 @@ fn unwrap_vxlan(frame: &[u8], vni: u32) -> Option<&[u8]> {
 // ---------------------------------------------------------------------------
 
 fn list_bridge_interfaces() -> Vec<String> {
-    let Ok(out) = std::process::Command::new("ifconfig").arg("-a").output() else { return vec![] };
-    let Ok(text) = std::str::from_utf8(&out.stdout) else { return vec![] };
+    let Ok(out) = std::process::Command::new("ifconfig").arg("-a").output() else {
+        return vec![];
+    };
+    let Ok(text) = std::str::from_utf8(&out.stdout) else {
+        return vec![];
+    };
     parse_bridge_names(text)
 }
 
 fn parse_bridge_names(ifconfig_output: &str) -> Vec<String> {
-    ifconfig_output.lines()
+    ifconfig_output
+        .lines()
         .filter(|l| !l.starts_with('\t') && !l.starts_with(' '))
         .filter_map(|l| {
             let name = l.split(':').next()?.trim().to_string();
-            if name.starts_with("bridge") { Some(name) } else { None }
+            if name.starts_with("bridge") {
+                Some(name)
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -714,12 +754,14 @@ fn parse_bridge_names(ifconfig_output: &str) -> Vec<String> {
 fn wait_for_new_bridge(before: &[String]) -> Result<String> {
     (0..30)
         .find_map(|i| {
-            if i > 0 { std::thread::sleep(Duration::from_millis(100)); }
+            if i > 0 {
+                std::thread::sleep(Duration::from_millis(100));
+            }
             find_new_bridge(before)
         })
-        .ok_or_else(|| anyhow::anyhow!(
-            "Bridge interface not found after 3 s. Run `ifconfig -a` to inspect."
-        ))
+        .ok_or_else(|| {
+            anyhow::anyhow!("Bridge interface not found after 3 s. Run `ifconfig -a` to inspect.")
+        })
 }
 
 /// Mock implementation: return immediately with a synthetic bridge name.
@@ -734,13 +776,20 @@ fn find_new_bridge(before: &[String]) -> Option<String> {
 
 fn find_new_bridge_in(current: &[String], before: &[String]) -> Option<String> {
     let before_set: std::collections::HashSet<&str> = before.iter().map(String::as_str).collect();
-    current.iter().find(|b| !before_set.contains(b.as_str())).cloned()
+    current
+        .iter()
+        .find(|b| !before_set.contains(b.as_str()))
+        .cloned()
 }
 
 /// Remove all IPv4 addresses from an interface.
 fn remove_all_inet4(iface: &str) {
-    let Ok(out) = std::process::Command::new("ifconfig").arg(iface).output() else { return };
-    let Ok(text) = std::str::from_utf8(&out.stdout) else { return };
+    let Ok(out) = std::process::Command::new("ifconfig").arg(iface).output() else {
+        return;
+    };
+    let Ok(text) = std::str::from_utf8(&out.stdout) else {
+        return;
+    };
     remove_inet4_addrs(iface, text);
 }
 
@@ -754,11 +803,16 @@ fn remove_inet4_addrs(iface: &str, ifconfig_output: &str) {
 }
 
 fn parse_inet4_addrs(ifconfig_output: &str) -> Vec<String> {
-    ifconfig_output.lines()
+    ifconfig_output
+        .lines()
         .filter_map(|line| {
             let rest = line.trim().strip_prefix("inet ")?;
             let addr = rest.split_whitespace().next()?;
-            if addr.is_empty() { None } else { Some(addr.to_string()) }
+            if addr.is_empty() {
+                None
+            } else {
+                Some(addr.to_string())
+            }
         })
         .collect()
 }
@@ -778,7 +832,10 @@ fn assign_inet4(iface: &str, cidr: &str) -> Result<()> {
 
 fn parse_cidr(cidr: &str) -> Result<(&str, &str)> {
     cidr.split_once('/').ok_or_else(|| {
-        anyhow::anyhow!("'{}' is not valid CIDR notation (expected addr/prefixlen)", cidr)
+        anyhow::anyhow!(
+            "'{}' is not valid CIDR notation (expected addr/prefixlen)",
+            cidr
+        )
     })
 }
 
@@ -865,7 +922,10 @@ mod tests {
     #[test]
     fn unwrap_valid_returns_inner_frame() {
         let eth = [0xDE, 0xAD, 0xBE, 0xEF];
-        assert_eq!(unwrap_vxlan(&make_frame(100, &eth), 100).unwrap(), eth.as_ref());
+        assert_eq!(
+            unwrap_vxlan(&make_frame(100, &eth), 100).unwrap(),
+            eth.as_ref()
+        );
     }
 
     #[test]
@@ -951,9 +1011,7 @@ mod tests {
             test_peer(1002, Some("10.42.2.0/24"), None),
         ];
         let mut eth = vec![
-            0x02, 0, 0, 0, 0, 9,
-            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-            0x08, 0x00,
+            0x02, 0, 0, 0, 0, 9, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x08, 0x00,
         ];
         eth.extend_from_slice(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0]);
         eth.extend_from_slice(&[10, 42, 8, 2, 10, 42, 2, 99]);
@@ -970,9 +1028,7 @@ mod tests {
             test_peer(1002, Some("10.42.1.0/24"), None),
         ];
         let mut eth = vec![
-            0x02, 0, 0, 0, 0, 9,
-            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-            0x08, 0x00,
+            0x02, 0, 0, 0, 0, 9, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x08, 0x00,
         ];
         eth.extend_from_slice(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0]);
         eth.extend_from_slice(&[10, 42, 8, 2, 10, 42, 1, 99]);
@@ -1037,7 +1093,10 @@ mod tests {
     #[test]
     fn roundtrip_preserves_payload() {
         let eth: Vec<u8> = (0u8..=63).collect();
-        assert_eq!(unwrap_vxlan(&make_frame(0xABCDEF, &eth), 0xABCDEF).unwrap(), eth.as_slice());
+        assert_eq!(
+            unwrap_vxlan(&make_frame(0xABCDEF, &eth), 0xABCDEF).unwrap(),
+            eth.as_slice()
+        );
     }
 
     #[test]
@@ -1077,7 +1136,10 @@ mod tests {
 
     #[test]
     fn bridge_name_accepts_maximum_vni() {
-        assert_eq!(bridge_name_for_vni(VXLAN_MAX_VNI).unwrap(), "bridge16777215");
+        assert_eq!(
+            bridge_name_for_vni(VXLAN_MAX_VNI).unwrap(),
+            "bridge16777215"
+        );
     }
 
     #[test]
@@ -1109,7 +1171,10 @@ mod tests {
     #[test]
     fn parse_bridges_multiple() {
         let input = "bridge0: flags=1\nbridge1: flags=2\nutun0: flags=3\nbridge100: flags=4\n";
-        assert_eq!(parse_bridge_names(input), vec!["bridge0", "bridge1", "bridge100"]);
+        assert_eq!(
+            parse_bridge_names(input),
+            vec!["bridge0", "bridge1", "bridge100"]
+        );
     }
 
     #[test]
@@ -1146,7 +1211,8 @@ mod tests {
 
     #[test]
     fn parse_inet4_ignores_inet6_lines() {
-        let input = "\tinet6 fe80::1%bridge100 prefixlen 64\n\tinet 192.168.1.1 netmask 0xffffff00\n";
+        let input =
+            "\tinet6 fe80::1%bridge100 prefixlen 64\n\tinet 192.168.1.1 netmask 0xffffff00\n";
         assert_eq!(parse_inet4_addrs(input), vec!["192.168.1.1"]);
     }
 
@@ -1167,14 +1233,14 @@ mod tests {
 
     #[test]
     fn find_new_bridge_in_finds_new() {
-        let before  = vec!["bridge0".to_string()];
+        let before = vec!["bridge0".to_string()];
         let current = vec!["bridge0".to_string(), "bridge100".to_string()];
         assert_eq!(find_new_bridge_in(&current, &before).unwrap(), "bridge100");
     }
 
     #[test]
     fn find_new_bridge_in_returns_first_new() {
-        let before  = vec![];
+        let before = vec![];
         let current = vec!["bridge0".to_string(), "bridge1".to_string()];
         assert_eq!(find_new_bridge_in(&current, &before).unwrap(), "bridge0");
     }
@@ -1263,8 +1329,12 @@ mod tests {
     mod mock_tests {
         use super::*;
 
-        fn local()  -> std::net::IpAddr { "127.0.0.1".parse().unwrap() }
-        fn remote() -> std::net::IpAddr { "127.0.0.1".parse().unwrap() }
+        fn local() -> std::net::IpAddr {
+            "127.0.0.1".parse().unwrap()
+        }
+        fn remote() -> std::net::IpAddr {
+            "127.0.0.1".parse().unwrap()
+        }
 
         /// Create a raw mock context for calling C-layer functions directly.
         /// Caller must pass it to `free_mock_ctx` when done.
@@ -1273,7 +1343,9 @@ mod tests {
         }
 
         unsafe fn free_mock_ctx(ctx: *mut libc::c_void) {
-            unsafe { vmnet_ctx_stop(ctx); }
+            unsafe {
+                vmnet_ctx_stop(ctx);
+            }
         }
 
         // -------------------------------------------------------------------
@@ -1315,7 +1387,8 @@ mod tests {
                 1450,
                 None,
                 None,
-            ).await;
+            )
+            .await;
             assert!(result.is_err());
         }
 
@@ -1323,16 +1396,21 @@ mod tests {
         async fn tunnel_new_fails_when_ctx_null() {
             // mock_start_fail is _Thread_local in C, so this only affects the
             // current OS thread — other parallel tests are unaffected.
-            unsafe { vmnet_mock_set_start_fail(1); }
+            unsafe {
+                vmnet_mock_set_start_fail(1);
+            }
             let result = VxlanTunnel::new(1, local(), remote(), 0, 1450, None, None).await;
-            unsafe { vmnet_mock_set_start_fail(0); }
+            unsafe {
+                vmnet_mock_set_start_fail(0);
+            }
             assert!(result.is_err());
         }
 
         #[tokio::test]
         async fn tunnel_new_propagates_ipv4_assignment_error() {
             // assign_inet4 will fail (nonexistent bridge) → new() returns Err.
-            let result = VxlanTunnel::new(1, local(), remote(), 0, 1450, Some("10.0.0.1/24"), None).await;
+            let result =
+                VxlanTunnel::new(1, local(), remote(), 0, 1450, Some("10.0.0.1/24"), None).await;
             assert!(result.is_err());
         }
 
@@ -1340,7 +1418,8 @@ mod tests {
         async fn tunnel_new_propagates_ipv6_assignment_error() {
             // bridge_ipv6 is Some → assign_inet6 is called; mock_bridge0 does
             // not exist, so ifconfig fails → new() returns Err.
-            let result = VxlanTunnel::new(1, local(), remote(), 0, 1450, None, Some("fd00::1/64")).await;
+            let result =
+                VxlanTunnel::new(1, local(), remote(), 0, 1450, None, Some("fd00::1/64")).await;
             assert!(result.is_err());
         }
 
@@ -1369,14 +1448,18 @@ mod tests {
             let ctx = unsafe { make_mock_ctx() };
             let frame = make_frame(42, &[0xABu8; 14]);
             vxlan_to_vmnet(&frame, 42, ctx, "mock_bridge0");
-            unsafe { free_mock_ctx(ctx); }
+            unsafe {
+                free_mock_ctx(ctx);
+            }
         }
 
         #[test]
         fn vxlan_to_vmnet_write_fail_logs_warning() {
             // vmnet_ctx_write returns -1 → the warning branch executes (lines 242-243).
             let ctx = unsafe { make_mock_ctx() };
-            unsafe { vmnet_mock_set_write_fail(1); }
+            unsafe {
+                vmnet_mock_set_write_fail(1);
+            }
             let frame = make_frame(99, &[0xCDu8; 14]);
             vxlan_to_vmnet(&frame, 99, ctx, "mock_bridge0");
             unsafe {
@@ -1401,11 +1484,17 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = tunnel.run_until(async {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                Ok(())
-            }).await;
-            assert!(result.is_ok(), "run_until() should return Ok: {:?}", result.err());
+            let result = tunnel
+                .run_until(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(())
+                })
+                .await;
+            assert!(
+                result.is_ok(),
+                "run_until() should return Ok: {:?}",
+                result.err()
+            );
         }
 
         /// A shutdown error still cancels and joins the forwarding workers
@@ -1416,9 +1505,9 @@ mod tests {
                 .await
                 .unwrap();
 
-            let result = tunnel.run_until(async {
-                Err(std::io::Error::other("test shutdown failure"))
-            }).await;
+            let result = tunnel
+                .run_until(async { Err(std::io::Error::other("test shutdown failure")) })
+                .await;
             assert!(result.is_err());
         }
 
@@ -1432,7 +1521,9 @@ mod tests {
                 .unwrap();
             tokio::spawn(async {
                 tokio::time::sleep(Duration::from_millis(50)).await;
-                unsafe { libc::kill(libc::getpid(), libc::SIGINT); }
+                unsafe {
+                    libc::kill(libc::getpid(), libc::SIGINT);
+                }
             });
             let result = tunnel.run().await;
             assert!(result.is_ok(), "run() should return Ok: {:?}", result.err());
@@ -1442,8 +1533,12 @@ mod tests {
         /// while all peers share the tunnel's single UDP socket.
         #[tokio::test]
         async fn tunnel_run_until_fans_out_to_all_remote_peers() {
-            let peer_a = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
-            let peer_b = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
+            let peer_a = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0))
+                .await
+                .unwrap();
+            let peer_b = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0))
+                .await
+                .unwrap();
             let peer_a_addr = peer_a.local_addr().unwrap();
             let peer_b_addr = peer_b.local_addr().unwrap();
             let tunnel = VxlanTunnel::new_with_peers(
@@ -1464,7 +1559,9 @@ mod tests {
                 1450,
                 None,
                 None,
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
 
             let expected = build_vxlan_payload(&[0xAAu8; 14], 77);
             let (packet_a, packet_b, result) = tokio::join!(
@@ -1497,8 +1594,12 @@ mod tests {
         /// duplicating a unicast frame to every configured peer.
         #[tokio::test]
         async fn tunnel_run_until_selects_mapped_peer_for_unicast() {
-            let peer_a = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
-            let peer_b = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
+            let peer_a = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0))
+                .await
+                .unwrap();
+            let peer_b = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0))
+                .await
+                .unwrap();
             let peer_a_addr = peer_a.local_addr().unwrap();
             let peer_b_addr = peer_b.local_addr().unwrap();
             let tunnel = VxlanTunnel::new_with_peers(
@@ -1519,7 +1620,9 @@ mod tests {
                 1450,
                 None,
                 None,
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
 
             let expected = build_vxlan_payload(&[0xAAu8; 14], 77);
             let (packet_a, packet_b, result) = tokio::join!(
@@ -1532,7 +1635,8 @@ mod tests {
                 },
                 async move {
                     let mut buf = vec![0u8; 65535];
-                    tokio::time::timeout(Duration::from_millis(250), peer_b.recv_from(&mut buf)).await
+                    tokio::time::timeout(Duration::from_millis(250), peer_b.recv_from(&mut buf))
+                        .await
                 },
                 tunnel.run_until(async {
                     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1542,7 +1646,10 @@ mod tests {
 
             assert!(result.is_ok(), "run_until() failed: {:?}", result.err());
             assert_eq!(packet_a.unwrap(), expected);
-            assert!(packet_b.is_err(), "unmatched VTEP must not receive a unicast frame");
+            assert!(
+                packet_b.is_err(),
+                "unmatched VTEP must not receive a unicast frame"
+            );
         }
 
         /// UDP self-loopback: bind the tunnel to port 0, discover the assigned
@@ -1567,11 +1674,17 @@ mod tests {
                 s.send_to(&vxlan_pkt, bound_addr).await.ok();
             });
 
-            let result = tunnel.run_until(async {
-                tokio::time::sleep(Duration::from_millis(150)).await;
-                Ok(())
-            }).await;
-            assert!(result.is_ok(), "run_until() should return Ok: {:?}", result.err());
+            let result = tunnel
+                .run_until(async {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Ok(())
+                })
+                .await;
+            assert!(
+                result.is_ok(),
+                "run_until() should return Ok: {:?}",
+                result.err()
+            );
         }
     }
 }
