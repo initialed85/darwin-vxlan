@@ -85,14 +85,15 @@ supplying a version such as `0.1.0`; the workflow creates the corresponding
 ## Usage
 
 ```
-darwin-vxlan --vni <VNI> --local <IP> --remote <IP> [--remote <IP> ...] [OPTIONS]
+darwin-vxlan --vni <VNI> --local <IP> (--remote <IP>... | --peer <POD_CIDR=UNDERLAY_IP>...) [OPTIONS]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--vni` | _(required)_ | VXLAN Network Identifier |
 | `--local` | _(required)_ | Local IP address for the VXLAN UDP socket |
-| `--remote` | _(required)_ | Remote VTEP IP address; repeat (or comma-separate) for each peer |
+| `--remote` | _(one of `--remote`/`--peer` required)_ | Unmapped remote VTEP IP fallback; repeat (or comma-separate) for each peer |
+| `--peer` | _(one of `--remote`/`--peer` required)_ | Destination mapping in `POD_CIDR=UNDERLAY_IP` form; repeat for each mapped VTEP |
 | `--port` | `4789` | UDP port used for the local VXLAN listen/bind and every remote destination; use `8472` for K3s Flannel |
 | `--mtu` | `1450` | MTU for the bridge interface |
 | `--bridge-ipv4` | — | IPv4 CIDR to assign to the bridge (e.g. `192.168.100.1/24`) |
@@ -142,15 +143,15 @@ Press `Ctrl+C` to shut down.
 
 K3s Flannel's VXLAN backend uses VNI `1` and UDP port `8472` (rather than the
 standard VXLAN port `4789`). `--port` controls the local UDP bind and every
-remote destination, so set it to `8472` for this interop. Repeat `--remote` for
-each Flannel node that should receive the local bridge's traffic:
+remote destination, so set it to `8472` for this interop. Use one `--peer`
+entry for each Flannel PodCIDR and its underlay VTEP address:
 
 ```sh
 sudo darwin-vxlan \
   --vni 1 \
   --local 192.168.1.128 \
-  --remote 192.168.1.111 \
-  --remote 192.168.1.112 \
+  --peer 10.42.1.0/24=192.168.1.111 \
+  --peer 10.42.2.0/24=192.168.1.112 \
   --port 8472 \
   --bridge-ipv4 10.42.0.250/16
 ```
@@ -162,14 +163,22 @@ allocator-selected bridge name because host-mode bridge numbering starts at
 
 ### Process concurrency
 
-A process owns one local UDP bind and can fan out each Ethernet frame to any
-number of `--remote` VTEP destinations. Incoming VXLAN packets are received on
-the same socket and accepted when their VNI matches. All CLI peers use the
-shared `--port` value, which should be `8472` for Flannel. Running another
-process with the same local address and UDP port will fail with an
-address-in-use error; vmnet bridge allocation must also not race between
-processes. Use repeated `--remote` options rather than several processes on the
-same bind endpoint.
+A process owns one local UDP bind and can select a destination-specific VTEP
+for each known unicast Ethernet frame. Pass mapped peers as repeated
+`--peer POD_CIDR=UNDERLAY_IP` options; the helper selects a peer from the
+inner IPv4/IPv6 destination CIDR. Maclet should install a per-PodCIDR
+synthetic gateway and static ARP entry so the inner destination MAC is also
+the corresponding Flannel VTEP MAC. The inner Ethernet frame is never
+rewritten. The API additionally accepts an optional VTEP MAC selector for
+callers that already have an FDB mapping. Broadcast, multicast, unknown-
+unicast, short, and legacy unmapped frames use the all-peer fallback. Use
+repeated `--remote` options for that fallback, or use `--remote` alongside
+`--peer` to add additional unmapped fallback destinations. Incoming VXLAN
+packets are received on the same socket and accepted when their VNI matches.
+All CLI peers use the shared `--port`, which should be `8472` for Flannel.
+Running another process with the same local address and UDP port will fail with
+an address-in-use error; vmnet bridge allocation must also not race between
+processes.
 
 ## Testing
 

@@ -3,9 +3,60 @@ mod vxlan;
 use anyhow::Result;
 use clap::Parser;
 use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_VXLAN_PORT: u16 = 4789;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PeerSpec {
+    underlay: IpAddr,
+    pod_cidr: Option<vxlan::IpCidr>,
+    vtep_mac: Option<[u8; 6]>,
+}
+
+impl FromStr for PeerSpec {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if let Some((pod_cidr, underlay)) = value.split_once('=') {
+            let pod_cidr = pod_cidr
+                .parse()
+                .map_err(|error| format!("invalid peer CIDR {pod_cidr}: {error}"))?;
+            let underlay = underlay
+                .parse()
+                .map_err(|_| format!("invalid underlay IP address: {underlay}"))?;
+            return Ok(Self {
+                underlay,
+                pod_cidr: Some(pod_cidr),
+                vtep_mac: None,
+            });
+        }
+
+        // Keep the earlier API shape available to direct callers while the
+        // CLI's documented form uses PodCIDR=underlay.
+        let (underlay, mac) = value
+            .split_once(',')
+            .ok_or_else(|| "expected POD_CIDR=UNDERLAY_IP".to_string())?;
+        let underlay = underlay
+            .parse()
+            .map_err(|_| format!("invalid underlay IP address: {underlay}"))?;
+        let octets: Vec<&str> = mac.split(':').collect();
+        if octets.len() != 6 || octets.iter().any(|octet| octet.len() != 2) {
+            return Err(format!("invalid VTEP MAC address: {mac}"));
+        }
+        let mut vtep_mac = [0u8; 6];
+        for (index, octet) in octets.iter().enumerate() {
+            vtep_mac[index] = u8::from_str_radix(octet, 16)
+                .map_err(|_| format!("invalid VTEP MAC address: {mac}"))?;
+        }
+        Ok(Self {
+            underlay,
+            pod_cidr: None,
+            vtep_mac: Some(vtep_mac),
+        })
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "darwin-vxlan")]
@@ -20,12 +71,21 @@ struct Args {
     #[arg(
         long = "remote",
         value_name = "IP",
-        required = true,
+        required_unless_present = "peer_specs",
         action = clap::ArgAction::Append,
         value_delimiter = ',',
-        help = "Remote peer IP address (repeat for each VTEP peer)",
+        help = "Unmapped remote VTEP IP fallback (repeat for each peer)",
     )]
     remotes: Vec<IpAddr>,
+
+    #[arg(
+        long = "peer",
+        value_name = "POD_CIDR=UNDERLAY_IP",
+        required_unless_present = "remotes",
+        action = clap::ArgAction::Append,
+        help = "Map an inner destination PodCIDR to an underlay IP (repeat per peer)",
+    )]
+    peer_specs: Vec<PeerSpec>,
 
     #[arg(
         long,
@@ -54,16 +114,24 @@ where
     F: std::future::Future<Output = std::io::Result<()>>,
 {
     tracing::info!(
-        "Starting darwin-vxlan — VNI {} | local {} | remotes {:?} | port {}",
-        args.vni, args.local, args.remotes, args.port
+        "Starting darwin-vxlan — VNI {} | local {} | remotes {:?} | peers {:?} | port {}",
+        args.vni, args.local, args.remotes, args.peer_specs, args.port
     );
 
     let local_addr = SocketAddr::new(args.local, args.port);
-    let remote_addrs = args.remotes.iter()
-        .copied()
-        .map(|remote| SocketAddr::new(remote, args.port))
+    let peers = args.peer_specs.iter()
+        .map(|peer| vxlan::VtepPeer {
+            endpoint: SocketAddr::new(peer.underlay, args.port),
+            pod_cidr: peer.pod_cidr.clone(),
+            vtep_mac: peer.vtep_mac,
+        })
+        .chain(args.remotes.iter().map(|remote| vxlan::VtepPeer {
+            endpoint: SocketAddr::new(*remote, args.port),
+            pod_cidr: None,
+            vtep_mac: None,
+        }))
         .collect();
-    let tunnel = if args.remotes.len() == 1 {
+    let tunnel = if args.peer_specs.is_empty() && args.remotes.len() == 1 {
         // Keep the original point-to-point constructor on the common path.
         vxlan::VxlanTunnel::new(
             args.vni,
@@ -75,10 +143,10 @@ where
             args.bridge_ipv6.as_deref(),
         ).await?
     } else {
-        vxlan::VxlanTunnel::new_with_remotes(
+        vxlan::VxlanTunnel::new_with_peers(
             args.vni,
             local_addr,
-            remote_addrs,
+            peers,
             args.mtu,
             args.bridge_ipv4.as_deref(),
             args.bridge_ipv6.as_deref(),
@@ -115,6 +183,7 @@ mod tests {
         ]).unwrap();
         assert_eq!(a.vni, 100);
         assert_eq!(a.remotes, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
+        assert!(a.peer_specs.is_empty());
         assert_eq!(a.port, DEFAULT_VXLAN_PORT);  // default
         assert_eq!(a.mtu, 1450);   // default
         assert!(a.bridge_ipv4.is_none());
@@ -163,6 +232,43 @@ mod tests {
     }
 
     #[test]
+    fn args_parse_peer_mappings() {
+        let a = Args::try_parse_from([
+            "darwin-vxlan", "--vni", "1",
+            "--local", "192.168.1.10",
+            "--peer", "10.42.1.0/24=192.168.1.111",
+            "--peer", "10.42.2.0/24=192.168.1.112",
+            "--port", "8472",
+        ]).unwrap();
+        assert!(a.remotes.is_empty());
+        assert_eq!(
+            a.peer_specs,
+            vec![
+                PeerSpec {
+                    underlay: "192.168.1.111".parse().unwrap(),
+                    pod_cidr: Some("10.42.1.0/24".parse().unwrap()),
+                    vtep_mac: None,
+                },
+                PeerSpec {
+                    underlay: "192.168.1.112".parse().unwrap(),
+                    pod_cidr: Some("10.42.2.0/24".parse().unwrap()),
+                    vtep_mac: None,
+                },
+            ]
+        );
+        assert_eq!(a.port, 8472);
+    }
+
+    #[test]
+    fn args_invalid_peer_mapping_fails() {
+        assert!(Args::try_parse_from([
+            "darwin-vxlan", "--vni", "1",
+            "--local", "192.168.1.10",
+            "--peer", "not-a-cidr=192.168.1.111",
+        ]).is_err());
+    }
+
+    #[test]
     fn args_parse_all_fields() {
         let a = Args::try_parse_from([
             "darwin-vxlan", "--vni", "42",
@@ -172,6 +278,8 @@ mod tests {
             "--bridge-ipv6", "fd00::1/64",
         ]).unwrap();
         assert_eq!(a.vni, 42);
+        assert_eq!(a.remotes, vec!["10.0.0.2".parse::<IpAddr>().unwrap()]);
+        assert!(a.peer_specs.is_empty());
         assert_eq!(a.port, 9999);
         assert_eq!(a.mtu, 1400);
         assert_eq!(a.bridge_ipv4.as_deref(), Some("192.168.100.1/24"));

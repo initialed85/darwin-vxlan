@@ -1,5 +1,6 @@
 use anyhow::Result;
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 
@@ -16,6 +17,99 @@ const VMNET_MAX_FORCED_VNI: u32 = 4095;
 use std::time::Duration;
 
 const VXLAN_HEADER_SIZE: usize = 8;
+
+/// An IPv4 or IPv6 network used to select the VTEP for an inner IP packet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IpCidr {
+    pub network: IpAddr,
+    pub prefix_len: u8,
+}
+
+impl IpCidr {
+    pub fn contains(&self, address: IpAddr) -> bool {
+        match (self.network, address) {
+            (IpAddr::V4(network), IpAddr::V4(address)) => {
+                let prefix = self.prefix_len;
+                if prefix > 32 {
+                    return false;
+                }
+                if prefix == 0 {
+                    true
+                } else {
+                    u32::from(network) >> (32 - prefix)
+                        == u32::from(address) >> (32 - prefix)
+                }
+            }
+            (IpAddr::V6(network), IpAddr::V6(address)) => {
+                let prefix = self.prefix_len;
+                if prefix > 128 {
+                    return false;
+                }
+                if prefix == 0 {
+                    true
+                } else {
+                    u128::from(network) >> (128 - prefix)
+                        == u128::from(address) >> (128 - prefix)
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+impl FromStr for IpCidr {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let (address, prefix_len) = value
+            .split_once('/')
+            .ok_or_else(|| "expected address/prefix length".to_string())?;
+        let address: IpAddr = address
+            .parse()
+            .map_err(|_| format!("invalid network address: {address}"))?;
+        let prefix_len: u8 = prefix_len
+            .parse()
+            .map_err(|_| format!("invalid prefix length: {prefix_len}"))?;
+        let max_prefix = match address {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        if prefix_len > max_prefix {
+            return Err(format!("prefix length {prefix_len} exceeds /{max_prefix}"));
+        }
+        let network = match address {
+            IpAddr::V4(address) => {
+                let bits = u32::from(address);
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix_len)
+                };
+                IpAddr::V4(Ipv4Addr::from(bits & mask))
+            }
+            IpAddr::V6(address) => {
+                let bits = u128::from(address);
+                let mask = if prefix_len == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix_len)
+                };
+                IpAddr::V6(Ipv6Addr::from(bits & mask))
+            }
+        };
+        Ok(Self { network, prefix_len })
+    }
+}
+
+/// A configured remote VTEP and optional selectors for its inner traffic.
+/// Entries without selectors are fallback peers for broadcast, unknown
+/// unicast, or legacy `--remote` operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VtepPeer {
+    pub endpoint: SocketAddr,
+    pub pod_cidr: Option<IpCidr>,
+    pub vtep_mac: Option<[u8; 6]>,
+}
 
 // ---------------------------------------------------------------------------
 // vmnet C FFI
@@ -46,7 +140,7 @@ unsafe extern "C" {
 
 pub struct VxlanTunnel {
     vni: u32,
-    remote_addrs: Vec<SocketAddr>,
+    peers: Vec<VtepPeer>,
     socket: Arc<UdpSocket>,
     /// Opaque pointer to heap-allocated vmnet_ctx_t.
     ctx: *mut libc::c_void,
@@ -218,9 +312,8 @@ impl VxlanTunnel {
     }
 
     /// Construct a tunnel with one local UDP socket and one or more remote
-    /// VTEP endpoints. Ethernet frames read from vmnet are sent to every
-    /// configured remote; incoming VXLAN frames are accepted on the shared
-    /// socket and still filtered by the requested VNI.
+    /// VTEP endpoints. This compatibility form has no inner-MAC mappings and
+    /// therefore preserves fan-out behavior for all configured endpoints.
     pub async fn new_with_remotes(
         vni: u32,
         local_addr: SocketAddr,
@@ -229,7 +322,29 @@ impl VxlanTunnel {
         bridge_ipv4: Option<&str>,
         bridge_ipv6: Option<&str>,
     ) -> Result<Self> {
-        if remote_addrs.is_empty() {
+        let peers = remote_addrs.into_iter()
+            .map(|endpoint| VtepPeer {
+                endpoint,
+                pod_cidr: None,
+                vtep_mac: None,
+            })
+            .collect();
+        Self::new_with_peers(vni, local_addr, peers, mtu, bridge_ipv4, bridge_ipv6).await
+    }
+
+    /// Construct a tunnel with one local UDP socket and destination-specific
+    /// VTEP mappings. Known unicast destination MACs are sent only to matching
+    /// peers; broadcast, multicast, unknown, and short Ethernet frames are
+    /// sent to every peer. The inner Ethernet frame is never rewritten.
+    pub async fn new_with_peers(
+        vni: u32,
+        local_addr: SocketAddr,
+        peers: Vec<VtepPeer>,
+        mtu: u32,
+        bridge_ipv4: Option<&str>,
+        bridge_ipv6: Option<&str>,
+    ) -> Result<Self> {
+        if peers.is_empty() {
             anyhow::bail!("at least one remote VTEP endpoint is required");
         }
 
@@ -295,13 +410,13 @@ impl VxlanTunnel {
             bridge, vmnet_mtu, max_pkt
         );
         tracing::info!(
-            "VXLAN ready: local={} remotes={:?} vni={}",
-            local_addr, remote_addrs, vni
+            "VXLAN ready: local={} peers={:?} vni={}",
+            local_addr, peers, vni
         );
 
         let tunnel = Self {
             vni,
-            remote_addrs,
+            peers,
             socket: Arc::new(socket),
             ctx,
             notify_fd,
@@ -329,7 +444,7 @@ impl VxlanTunnel {
         F: std::future::Future<Output = std::io::Result<()>>,
     {
         let vni               = self.vni;
-        let remote_addrs      = self.remote_addrs.clone();
+        let peers              = self.peers.clone();
         let notify_fd         = self.notify_fd;
         let shutdown_write_fd = self.shutdown_write_fd;
         let shutdown_read_fd  = self.shutdown_read_fd;
@@ -394,7 +509,7 @@ impl VxlanTunnel {
                         let Some(eth_frame) = maybe_frame else { break };
                         tracing::debug!("vmnet→vxlan: {} bytes", eth_frame.len());
                         let vxlan = build_vxlan_payload(&eth_frame, vni);
-                        for remote_addr in &remote_addrs {
+                        for remote_addr in select_peer_endpoints(&eth_frame, &peers) {
                             socket_tx.send_to(&vxlan, remote_addr).await.ok();
                         }
                     }
@@ -467,6 +582,88 @@ fn build_vxlan_payload(eth: &[u8], vni: u32) -> Vec<u8> {
     pkt.push(0x00);                                     // reserved
     pkt.extend_from_slice(eth);
     pkt
+}
+
+/// Select outer destinations from the inner Ethernet destination.
+///
+/// A mapped unicast destination is sent only to its matching VTEP. Ethernet
+/// broadcast/multicast, unknown unicast, malformed/short frames, and legacy
+/// peers without mappings intentionally use the all-peer fallback. The
+/// caller still sends the original Ethernet payload unchanged.
+fn select_peer_endpoints(eth: &[u8], peers: &[VtepPeer]) -> Vec<SocketAddr> {
+    let destination_mac: Option<[u8; 6]> = eth
+        .get(..6)
+        .and_then(|bytes| bytes.try_into().ok());
+    if destination_mac.is_none_or(|mac| mac[0] & 1 != 0) {
+        return unique_peer_endpoints(peers);
+    }
+
+    let destination_mac = destination_mac.unwrap();
+    let mapped_by_mac: Vec<&VtepPeer> = peers
+        .iter()
+        .filter(|peer| peer.vtep_mac == Some(destination_mac))
+        .collect();
+    if !mapped_by_mac.is_empty() {
+        return unique_peer_endpoints_refs(mapped_by_mac);
+    }
+
+    if let Some(destination_ip) = inner_destination_ip(eth) {
+        let longest_prefix = peers
+            .iter()
+            .filter_map(|peer| peer.pod_cidr.as_ref())
+            .filter(|cidr| cidr.contains(destination_ip))
+            .map(|cidr| cidr.prefix_len)
+            .max();
+        if let Some(longest_prefix) = longest_prefix {
+            let mapped_by_ip: Vec<&VtepPeer> = peers
+                .iter()
+                .filter(|peer| {
+                    peer.pod_cidr.as_ref().is_some_and(|cidr| {
+                        cidr.prefix_len == longest_prefix && cidr.contains(destination_ip)
+                    })
+                })
+                .collect();
+            return unique_peer_endpoints_refs(mapped_by_ip);
+        }
+    }
+
+    unique_peer_endpoints(peers)
+}
+
+fn inner_destination_ip(eth: &[u8]) -> Option<IpAddr> {
+    if eth.len() < 14 {
+        return None;
+    }
+    let ether_type = u16::from_be_bytes([eth[12], eth[13]]);
+    match ether_type {
+        0x0800 if eth.len() >= 34 && eth[14] >> 4 == 4 => {
+            Some(IpAddr::V4(Ipv4Addr::new(eth[30], eth[31], eth[32], eth[33])))
+        }
+        0x0806 if eth.len() >= 42 => {
+            Some(IpAddr::V4(Ipv4Addr::new(eth[38], eth[39], eth[40], eth[41])))
+        }
+        0x86DD if eth.len() >= 54 && eth[14] >> 4 == 6 => {
+            Some(IpAddr::V6(Ipv6Addr::from([
+                eth[38], eth[39], eth[40], eth[41],
+                eth[42], eth[43], eth[44], eth[45],
+                eth[46], eth[47], eth[48], eth[49],
+                eth[50], eth[51], eth[52], eth[53],
+            ])))
+        }
+        _ => None,
+    }
+}
+
+fn unique_peer_endpoints(peers: &[VtepPeer]) -> Vec<SocketAddr> {
+    unique_peer_endpoints_refs(peers.iter().collect())
+}
+
+fn unique_peer_endpoints_refs(peers: Vec<&VtepPeer>) -> Vec<SocketAddr> {
+    let mut seen = std::collections::HashSet::new();
+    peers
+        .into_iter()
+        .filter_map(|peer| seen.insert(peer.endpoint).then_some(peer.endpoint))
+        .collect()
 }
 
 /// Strip the VXLAN header and inject the inner Ethernet frame into vmnet.
@@ -699,6 +896,138 @@ mod tests {
     #[test]
     fn unwrap_vni_max_matches() {
         assert!(unwrap_vxlan(&make_frame(0xFF_FF_FF, &[0x22; 14]), 0xFF_FF_FF).is_some());
+    }
+
+    // -----------------------------------------------------------------------
+    // Peer destination selection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cidr_parsing_normalizes_and_matches_ipv4() {
+        let cidr: IpCidr = "10.42.1.17/24".parse().unwrap();
+        assert_eq!(cidr.network, "10.42.1.0".parse::<IpAddr>().unwrap());
+        assert!(cidr.contains("10.42.1.99".parse().unwrap()));
+        assert!(!cidr.contains("10.42.2.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_parsing_matches_ipv6_without_cross_family_match() {
+        let cidr: IpCidr = "fd00::17/64".parse().unwrap();
+        assert!(cidr.contains("fd00::abcd".parse().unwrap()));
+        assert!(!cidr.contains("10.42.1.1".parse().unwrap()));
+    }
+
+    #[test]
+    fn cidr_parsing_rejects_invalid_prefix() {
+        assert!("10.42.0.0/33".parse::<IpCidr>().is_err());
+        assert!("fd00::/129".parse::<IpCidr>().is_err());
+    }
+
+    fn test_peer(port: u16, pod_cidr: Option<&str>, vtep_mac: Option<[u8; 6]>) -> VtepPeer {
+        VtepPeer {
+            endpoint: SocketAddr::new("127.0.0.1".parse().unwrap(), port),
+            pod_cidr: pod_cidr.map(|cidr| cidr.parse().unwrap()),
+            vtep_mac,
+        }
+    }
+
+    #[test]
+    fn mapped_unicast_selects_only_matching_peer() {
+        let peers = vec![
+            test_peer(1001, Some("10.42.1.0/24"), Some([0x02, 0, 0, 0, 0, 1])),
+            test_peer(1002, Some("10.42.2.0/24"), Some([0x02, 0, 0, 0, 0, 2])),
+        ];
+        let eth = [0x02, 0, 0, 0, 0, 2, 0xAA, 0xBB];
+        assert_eq!(
+            select_peer_endpoints(&eth, &peers),
+            vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 1002)]
+        );
+    }
+
+    #[test]
+    fn mapped_ipv4_unicast_selects_only_matching_peer() {
+        let peers = vec![
+            test_peer(1001, Some("10.42.1.0/24"), None),
+            test_peer(1002, Some("10.42.2.0/24"), None),
+        ];
+        let mut eth = vec![
+            0x02, 0, 0, 0, 0, 9,
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            0x08, 0x00,
+        ];
+        eth.extend_from_slice(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0]);
+        eth.extend_from_slice(&[10, 42, 8, 2, 10, 42, 2, 99]);
+        assert_eq!(
+            select_peer_endpoints(&eth, &peers),
+            vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 1002)]
+        );
+    }
+
+    #[test]
+    fn overlapping_cidrs_choose_the_longest_prefix() {
+        let peers = vec![
+            test_peer(1001, Some("10.42.0.0/16"), None),
+            test_peer(1002, Some("10.42.1.0/24"), None),
+        ];
+        let mut eth = vec![
+            0x02, 0, 0, 0, 0, 9,
+            0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
+            0x08, 0x00,
+        ];
+        eth.extend_from_slice(&[0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0]);
+        eth.extend_from_slice(&[10, 42, 8, 2, 10, 42, 1, 99]);
+        assert_eq!(
+            select_peer_endpoints(&eth, &peers),
+            vec![SocketAddr::new("127.0.0.1".parse().unwrap(), 1002)]
+        );
+    }
+
+    #[test]
+    fn unknown_unicast_falls_back_to_all_peers() {
+        let peers = vec![
+            test_peer(1001, Some("10.42.1.0/24"), Some([0x02, 0, 0, 0, 0, 1])),
+            test_peer(1002, Some("10.42.2.0/24"), Some([0x02, 0, 0, 0, 0, 2])),
+        ];
+        let eth = [0x02, 0, 0, 0, 0, 9, 0xAA, 0xBB];
+        assert_eq!(
+            select_peer_endpoints(&eth, &peers),
+            peers.iter().map(|peer| peer.endpoint).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn broadcast_and_multicast_fall_back_to_all_peers() {
+        let peers = vec![
+            test_peer(1001, Some("10.42.1.0/24"), Some([0x02, 0, 0, 0, 0, 1])),
+            test_peer(1002, Some("10.42.2.0/24"), Some([0x02, 0, 0, 0, 0, 2])),
+        ];
+        for destination in [[0xFF; 6], [0x01, 0, 0, 0, 0, 1]] {
+            let mut eth = destination.to_vec();
+            eth.extend_from_slice(&[0xAA, 0xBB]);
+            assert_eq!(
+                select_peer_endpoints(&eth, &peers),
+                peers.iter().map(|peer| peer.endpoint).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_peer_endpoints_are_sent_once() {
+        let endpoint = SocketAddr::new("127.0.0.1".parse().unwrap(), 1001);
+        let peers = vec![
+            VtepPeer {
+                endpoint,
+                pod_cidr: None,
+                vtep_mac: Some([0x02, 0, 0, 0, 0, 1]),
+            },
+            VtepPeer {
+                endpoint,
+                pod_cidr: None,
+                vtep_mac: None,
+            },
+        ];
+        let eth = [0x02, 0, 0, 0, 0, 9, 0xAA, 0xBB];
+        assert_eq!(select_peer_endpoints(&eth, &peers), vec![endpoint]);
     }
 
     // -----------------------------------------------------------------------
@@ -967,7 +1296,14 @@ mod tests {
                 .await
                 .expect("new() should bind the requested port with mock backend");
             assert_eq!(t.local_addr().unwrap().port(), 8472);
-            assert_eq!(t.remote_addrs, vec![SocketAddr::new(remote(), 8472)]);
+            assert_eq!(
+                t.peers,
+                vec![VtepPeer {
+                    endpoint: SocketAddr::new(remote(), 8472),
+                    pod_cidr: None,
+                    vtep_mac: None,
+                }]
+            );
         }
 
         #[tokio::test]
@@ -1110,10 +1446,21 @@ mod tests {
             let peer_b = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
             let peer_a_addr = peer_a.local_addr().unwrap();
             let peer_b_addr = peer_b.local_addr().unwrap();
-            let tunnel = VxlanTunnel::new_with_remotes(
+            let tunnel = VxlanTunnel::new_with_peers(
                 77,
                 SocketAddr::new(local(), 0),
-                vec![peer_a_addr, peer_b_addr],
+                vec![
+                    VtepPeer {
+                        endpoint: peer_a_addr,
+                        pod_cidr: None,
+                        vtep_mac: None,
+                    },
+                    VtepPeer {
+                        endpoint: peer_b_addr,
+                        pod_cidr: None,
+                        vtep_mac: None,
+                    },
+                ],
                 1450,
                 None,
                 None,
@@ -1144,6 +1491,58 @@ mod tests {
             assert!(result.is_ok(), "run_until() failed: {:?}", result.err());
             assert_eq!(packet_a.unwrap(), expected);
             assert_eq!(packet_b.unwrap(), expected);
+        }
+
+        /// Verify a mapped inner destination MAC selects one VTEP rather than
+        /// duplicating a unicast frame to every configured peer.
+        #[tokio::test]
+        async fn tunnel_run_until_selects_mapped_peer_for_unicast() {
+            let peer_a = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
+            let peer_b = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
+            let peer_a_addr = peer_a.local_addr().unwrap();
+            let peer_b_addr = peer_b.local_addr().unwrap();
+            let tunnel = VxlanTunnel::new_with_peers(
+                77,
+                SocketAddr::new(local(), 0),
+                vec![
+                    VtepPeer {
+                        endpoint: peer_a_addr,
+                        pod_cidr: None,
+                        vtep_mac: Some([0xAA; 6]),
+                    },
+                    VtepPeer {
+                        endpoint: peer_b_addr,
+                        pod_cidr: None,
+                        vtep_mac: Some([0xBB; 6]),
+                    },
+                ],
+                1450,
+                None,
+                None,
+            ).await.unwrap();
+
+            let expected = build_vxlan_payload(&[0xAAu8; 14], 77);
+            let (packet_a, packet_b, result) = tokio::join!(
+                async move {
+                    let mut buf = vec![0u8; 65535];
+                    tokio::time::timeout(Duration::from_secs(1), peer_a.recv_from(&mut buf))
+                        .await
+                        .expect("mapped peer should receive the packet")
+                        .map(|(len, _)| buf[..len].to_vec())
+                },
+                async move {
+                    let mut buf = vec![0u8; 65535];
+                    tokio::time::timeout(Duration::from_millis(250), peer_b.recv_from(&mut buf)).await
+                },
+                tunnel.run_until(async {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    Ok(())
+                }),
+            );
+
+            assert!(result.is_ok(), "run_until() failed: {:?}", result.err());
+            assert_eq!(packet_a.unwrap(), expected);
+            assert!(packet_b.is_err(), "unmatched VTEP must not receive a unicast frame");
         }
 
         /// UDP self-loopback: bind the tunnel to port 0, discover the assigned
