@@ -46,7 +46,7 @@ unsafe extern "C" {
 
 pub struct VxlanTunnel {
     vni: u32,
-    remote_addr: SocketAddr,
+    remote_addrs: Vec<SocketAddr>,
     socket: Arc<UdpSocket>,
     /// Opaque pointer to heap-allocated vmnet_ctx_t.
     ctx: *mut libc::c_void,
@@ -195,6 +195,9 @@ impl VxlanTunnel {
 // ---------------------------------------------------------------------------
 
 impl VxlanTunnel {
+    /// Construct a point-to-point tunnel using the same UDP port for the
+    /// local bind and its single remote peer. Kept as a compatibility wrapper
+    /// for callers that do not need peer fan-out.
     pub async fn new(
         vni: u32,
         local: IpAddr,
@@ -204,10 +207,35 @@ impl VxlanTunnel {
         bridge_ipv4: Option<&str>,
         bridge_ipv6: Option<&str>,
     ) -> Result<Self> {
+        Self::new_with_remotes(
+            vni,
+            SocketAddr::new(local, port),
+            vec![SocketAddr::new(remote, port)],
+            mtu,
+            bridge_ipv4,
+            bridge_ipv6,
+        ).await
+    }
+
+    /// Construct a tunnel with one local UDP socket and one or more remote
+    /// VTEP endpoints. Ethernet frames read from vmnet are sent to every
+    /// configured remote; incoming VXLAN frames are accepted on the shared
+    /// socket and still filtered by the requested VNI.
+    pub async fn new_with_remotes(
+        vni: u32,
+        local_addr: SocketAddr,
+        remote_addrs: Vec<SocketAddr>,
+        mtu: u32,
+        bridge_ipv4: Option<&str>,
+        bridge_ipv6: Option<&str>,
+    ) -> Result<Self> {
+        if remote_addrs.is_empty() {
+            anyhow::bail!("at least one remote VTEP endpoint is required");
+        }
+
         let desired_bridge = bridge_name_for_vni(vni)?;
-        let socket = UdpSocket::bind(SocketAddr::new(local, port)).await
+        let socket = UdpSocket::bind(local_addr).await
             .map_err(|e| anyhow::anyhow!("Failed to bind UDP socket: {}", e))?;
-        let remote_addr = SocketAddr::new(remote, port);
         #[cfg(feature = "vmnet-mock")]
         let _ = &desired_bridge;
 
@@ -267,13 +295,13 @@ impl VxlanTunnel {
             bridge, vmnet_mtu, max_pkt
         );
         tracing::info!(
-            "VXLAN ready: local={} remote={} port={} vni={}",
-            local, remote, port, vni
+            "VXLAN ready: local={} remotes={:?} vni={}",
+            local_addr, remote_addrs, vni
         );
 
         let tunnel = Self {
             vni,
-            remote_addr,
+            remote_addrs,
             socket: Arc::new(socket),
             ctx,
             notify_fd,
@@ -301,7 +329,7 @@ impl VxlanTunnel {
         F: std::future::Future<Output = std::io::Result<()>>,
     {
         let vni               = self.vni;
-        let remote_addr       = self.remote_addr;
+        let remote_addrs      = self.remote_addrs.clone();
         let notify_fd         = self.notify_fd;
         let shutdown_write_fd = self.shutdown_write_fd;
         let shutdown_read_fd  = self.shutdown_read_fd;
@@ -366,7 +394,9 @@ impl VxlanTunnel {
                         let Some(eth_frame) = maybe_frame else { break };
                         tracing::debug!("vmnet→vxlan: {} bytes", eth_frame.len());
                         let vxlan = build_vxlan_payload(&eth_frame, vni);
-                        socket_tx.send_to(&vxlan, remote_addr).await.ok();
+                        for remote_addr in &remote_addrs {
+                            socket_tx.send_to(&vxlan, remote_addr).await.ok();
+                        }
                     }
                 }
             }
@@ -937,7 +967,20 @@ mod tests {
                 .await
                 .expect("new() should bind the requested port with mock backend");
             assert_eq!(t.local_addr().unwrap().port(), 8472);
-            assert_eq!(t.remote_addr.port(), 8472);
+            assert_eq!(t.remote_addrs, vec![SocketAddr::new(remote(), 8472)]);
+        }
+
+        #[tokio::test]
+        async fn tunnel_new_with_remotes_rejects_empty_peer_list() {
+            let result = VxlanTunnel::new_with_remotes(
+                1,
+                SocketAddr::new(local(), 0),
+                Vec::new(),
+                1450,
+                None,
+                None,
+            ).await;
+            assert!(result.is_err());
         }
 
         #[tokio::test]
@@ -1057,6 +1100,50 @@ mod tests {
             });
             let result = tunnel.run().await;
             assert!(result.is_ok(), "run() should return Ok: {:?}", result.err());
+        }
+
+        /// Verify that one Ethernet frame is sent to every configured VTEP
+        /// while all peers share the tunnel's single UDP socket.
+        #[tokio::test]
+        async fn tunnel_run_until_fans_out_to_all_remote_peers() {
+            let peer_a = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
+            let peer_b = tokio::net::UdpSocket::bind(SocketAddr::new(local(), 0)).await.unwrap();
+            let peer_a_addr = peer_a.local_addr().unwrap();
+            let peer_b_addr = peer_b.local_addr().unwrap();
+            let tunnel = VxlanTunnel::new_with_remotes(
+                77,
+                SocketAddr::new(local(), 0),
+                vec![peer_a_addr, peer_b_addr],
+                1450,
+                None,
+                None,
+            ).await.unwrap();
+
+            let expected = build_vxlan_payload(&[0xAAu8; 14], 77);
+            let (packet_a, packet_b, result) = tokio::join!(
+                async move {
+                    let mut buf = vec![0u8; 65535];
+                    tokio::time::timeout(Duration::from_secs(1), peer_a.recv_from(&mut buf))
+                        .await
+                        .expect("peer A should receive a fan-out packet")
+                        .map(|(len, _)| buf[..len].to_vec())
+                },
+                async move {
+                    let mut buf = vec![0u8; 65535];
+                    tokio::time::timeout(Duration::from_secs(1), peer_b.recv_from(&mut buf))
+                        .await
+                        .expect("peer B should receive a fan-out packet")
+                        .map(|(len, _)| buf[..len].to_vec())
+                },
+                tunnel.run_until(async {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Ok(())
+                }),
+            );
+
+            assert!(result.is_ok(), "run_until() failed: {:?}", result.err());
+            assert_eq!(packet_a.unwrap(), expected);
+            assert_eq!(packet_b.unwrap(), expected);
         }
 
         /// UDP self-loopback: bind the tunnel to port 0, discover the assigned

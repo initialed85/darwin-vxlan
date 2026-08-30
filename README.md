@@ -21,7 +21,7 @@ UDP :4789  ◄──── VXLAN/UDP ────►  UDP :4789
 
 - A thin C wrapper (`vmnet_bridge.c`) exposes `vmnet.framework`'s Objective-C/GCD API as plain C symbols that Rust FFI can call.
 - A pipe-based notification model avoids busy-polling: vmnet signals the pipe on packet arrival, Rust calls `poll(2)` on it.
-- Each `darwin-vxlan` process owns one vmnet host-mode interface and one UDP socket. Three concurrent data-plane workers run inside that process: a blocking thread drains vmnet reads, an async task forwards Ethernet frames → VXLAN → UDP, and a second async task receives UDP → VXLAN → vmnet.
+- Each `darwin-vxlan` process owns one vmnet host-mode interface and one UDP socket. Three concurrent data-plane workers run inside that process: a blocking thread drains vmnet reads, an async task forwards Ethernet frames → VXLAN → UDP to every configured peer, and a second async task receives UDP → VXLAN → vmnet.
 - Shutdown is coordinated through a second pipe and an async cancellation signal: writing one byte unblocks the `poll(2)` loop, and all forwarding workers are joined before the vmnet context is dropped.
 
 ## Requirements
@@ -85,15 +85,15 @@ supplying a version such as `0.1.0`; the workflow creates the corresponding
 ## Usage
 
 ```
-darwin-vxlan --vni <VNI> --local <IP> --remote <IP> [OPTIONS]
+darwin-vxlan --vni <VNI> --local <IP> --remote <IP> [--remote <IP> ...] [OPTIONS]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--vni` | _(required)_ | VXLAN Network Identifier |
 | `--local` | _(required)_ | Local IP address for the VXLAN UDP socket |
-| `--remote` | _(required)_ | Remote peer IP address |
-| `--port` | `4789` | UDP port used for both the local VXLAN listen/bind and the remote peer destination; use `8472` for K3s Flannel |
+| `--remote` | _(required)_ | Remote VTEP IP address; repeat (or comma-separate) for each peer |
+| `--port` | `4789` | UDP port used for the local VXLAN listen/bind and every remote destination; use `8472` for K3s Flannel |
 | `--mtu` | `1450` | MTU for the bridge interface |
 | `--bridge-ipv4` | — | IPv4 CIDR to assign to the bridge (e.g. `192.168.100.1/24`) |
 | `--bridge-ipv6` | — | IPv6 CIDR to assign to the bridge (e.g. `fd00::1/64`) |
@@ -141,14 +141,16 @@ Press `Ctrl+C` to shut down.
 ### Example: interoperate with K3s Flannel
 
 K3s Flannel's VXLAN backend uses VNI `1` and UDP port `8472` (rather than the
-standard VXLAN port `4789`). `--port` controls both the local UDP bind and the
-remote destination, so set it to `8472` for this interop:
+standard VXLAN port `4789`). `--port` controls the local UDP bind and every
+remote destination, so set it to `8472` for this interop. Repeat `--remote` for
+each Flannel node that should receive the local bridge's traffic:
 
 ```sh
 sudo darwin-vxlan \
   --vni 1 \
   --local 192.168.1.128 \
   --remote 192.168.1.111 \
+  --remote 192.168.1.112 \
   --port 8472 \
   --bridge-ipv4 10.42.0.250/16
 ```
@@ -160,13 +162,14 @@ allocator-selected bridge name because host-mode bridge numbering starts at
 
 ### Process concurrency
 
-A process is currently a single point-to-point VXLAN endpoint: it has one
-`--remote` destination and one local UDP bind. Running another process with the
-same local address and UDP port will fail with an address-in-use error. Multiple
-processes are possible only when they use distinct local bind addresses/ports,
-and vmnet bridge allocation must not race between processes. To reach multiple
-Flannel peers, use a design that provides peer fan-out rather than starting
-several processes on the same `--port 8472`.
+A process owns one local UDP bind and can fan out each Ethernet frame to any
+number of `--remote` VTEP destinations. Incoming VXLAN packets are received on
+the same socket and accepted when their VNI matches. All CLI peers use the
+shared `--port` value, which should be `8472` for Flannel. Running another
+process with the same local address and UDP port will fail with an
+address-in-use error; vmnet bridge allocation must also not race between
+processes. Use repeated `--remote` options rather than several processes on the
+same bind endpoint.
 
 ## Testing
 

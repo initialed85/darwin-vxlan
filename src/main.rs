@@ -2,7 +2,7 @@ mod vxlan;
 
 use anyhow::Result;
 use clap::Parser;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const DEFAULT_VXLAN_PORT: u16 = 4789;
@@ -17,14 +17,21 @@ struct Args {
     #[arg(long, help = "Local IP address for the VXLAN UDP socket")]
     local: IpAddr,
 
-    #[arg(long, help = "Remote peer IP address")]
-    remote: IpAddr,
+    #[arg(
+        long = "remote",
+        value_name = "IP",
+        required = true,
+        action = clap::ArgAction::Append,
+        value_delimiter = ',',
+        help = "Remote peer IP address (repeat for each VTEP peer)",
+    )]
+    remotes: Vec<IpAddr>,
 
     #[arg(
         long,
         default_value_t = DEFAULT_VXLAN_PORT,
         value_name = "PORT",
-        help = "UDP port for the local VXLAN listen/bind and remote peer destination (use 8472 for K3s Flannel)",
+        help = "UDP port for the local VXLAN listen/bind and every remote destination (use 8472 for K3s Flannel)",
     )]
     port: u16,
 
@@ -47,19 +54,36 @@ where
     F: std::future::Future<Output = std::io::Result<()>>,
 {
     tracing::info!(
-        "Starting darwin-vxlan — VNI {} | local {} | remote {} | port {}",
-        args.vni, args.local, args.remote, args.port
+        "Starting darwin-vxlan — VNI {} | local {} | remotes {:?} | port {}",
+        args.vni, args.local, args.remotes, args.port
     );
 
-    let tunnel = vxlan::VxlanTunnel::new(
-        args.vni,
-        args.local,
-        args.remote,
-        args.port,
-        args.mtu,
-        args.bridge_ipv4.as_deref(),
-        args.bridge_ipv6.as_deref(),
-    ).await?;
+    let local_addr = SocketAddr::new(args.local, args.port);
+    let remote_addrs = args.remotes.iter()
+        .copied()
+        .map(|remote| SocketAddr::new(remote, args.port))
+        .collect();
+    let tunnel = if args.remotes.len() == 1 {
+        // Keep the original point-to-point constructor on the common path.
+        vxlan::VxlanTunnel::new(
+            args.vni,
+            args.local,
+            args.remotes[0],
+            args.port,
+            args.mtu,
+            args.bridge_ipv4.as_deref(),
+            args.bridge_ipv6.as_deref(),
+        ).await?
+    } else {
+        vxlan::VxlanTunnel::new_with_remotes(
+            args.vni,
+            local_addr,
+            remote_addrs,
+            args.mtu,
+            args.bridge_ipv4.as_deref(),
+            args.bridge_ipv6.as_deref(),
+        ).await?
+    };
 
     tunnel.run_until(shutdown).await?;
 
@@ -90,6 +114,7 @@ mod tests {
             "--local", "0.0.0.0", "--remote", "1.2.3.4",
         ]).unwrap();
         assert_eq!(a.vni, 100);
+        assert_eq!(a.remotes, vec!["1.2.3.4".parse::<IpAddr>().unwrap()]);
         assert_eq!(a.port, DEFAULT_VXLAN_PORT);  // default
         assert_eq!(a.mtu, 1450);   // default
         assert!(a.bridge_ipv4.is_none());
@@ -104,7 +129,37 @@ mod tests {
             "--port", "8472",
         ]).unwrap();
         assert_eq!(a.vni, 1);
+        assert_eq!(a.remotes, vec!["192.168.1.11".parse::<IpAddr>().unwrap()]);
         assert_eq!(a.port, 8472);
+    }
+
+    #[test]
+    fn args_parse_multiple_remote_peers() {
+        let a = Args::try_parse_from([
+            "darwin-vxlan", "--vni", "1",
+            "--local", "192.168.1.10",
+            "--remote", "192.168.1.11",
+            "--remote", "192.168.1.12",
+            "--port", "8472",
+        ]).unwrap();
+        assert_eq!(a.remotes, vec![
+            "192.168.1.11".parse::<IpAddr>().unwrap(),
+            "192.168.1.12".parse::<IpAddr>().unwrap(),
+        ]);
+        assert_eq!(a.port, 8472);
+    }
+
+    #[test]
+    fn args_parse_comma_delimited_remote_peers() {
+        let a = Args::try_parse_from([
+            "darwin-vxlan", "--vni", "1",
+            "--local", "192.168.1.10",
+            "--remote", "192.168.1.11,192.168.1.12",
+        ]).unwrap();
+        assert_eq!(a.remotes, vec![
+            "192.168.1.11".parse::<IpAddr>().unwrap(),
+            "192.168.1.12".parse::<IpAddr>().unwrap(),
+        ]);
     }
 
     #[test]
