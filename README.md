@@ -110,14 +110,17 @@ As a result:
 --vni 137  ->  bridge137
 ```
 
-The temporary bridge devices are destroyed after vmnet starts. The requested
-bridge must not already exist, and bridge allocation must not race another
-program creating a bridge. This requires the same privileges as vmnet (run as
-root or use the vmnet entitlement). For VNIs below 100, vmnet's
-allocator-selected bridge name is accepted because it cannot be coupled to
-`bridge<VNI>`; the VNI still remains in every VXLAN header. The current
-allocator hack also refuses VNIs above 4095 rather than creating thousands of
-temporary bridge devices.
+The production vmnet wrapper requests a fresh UUID for each process's
+host-mode network. This keeps vmnet from silently attaching a new interface to
+an existing host network, so bridge discovery remains tied to the interface
+created by this process. The temporary bridge devices are destroyed after
+vmnet starts. The requested bridge must not already exist, and bridge
+allocation must not race another program creating a bridge. This requires the
+same privileges as vmnet (run as root or use the vmnet entitlement). For VNIs
+below 100, vmnet's allocator-selected bridge name is accepted because it cannot
+be coupled to `bridge<VNI>`; the VNI still remains in every VXLAN header. The
+current allocator hack also refuses VNIs above 4095 rather than creating
+thousands of temporary bridge devices.
 
 ### Example: point-to-point tunnel between two macOS hosts
 

@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <uuid/uuid.h>
 
 typedef struct {
     interface_ref    iface;
@@ -58,6 +59,18 @@ vmnet_ctx_t *vmnet_ctx_start(uint32_t requested_mtu) {
 
     xpc_object_t params = xpc_dictionary_create(NULL, NULL, 0);
     xpc_dictionary_set_uint64(params, vmnet_operation_mode_key, VMNET_HOST_MODE);
+
+    /*
+     * A host-mode interface without a network identifier can be attached to
+     * an existing vmnet host network. Request a fresh, isolated network for
+     * this process so bridge discovery cannot mistake another tunnel's
+     * bridge for the interface created here. vmnet expects a UUID XPC value,
+     * not a string or generic data object.
+     */
+    uuid_t network_id;
+    uuid_generate_random(network_id);
+    xpc_dictionary_set_uuid(params, vmnet_network_identifier_key, network_id);
+
     if (requested_mtu > 0)
         xpc_dictionary_set_uint64(params, vmnet_mtu_key, requested_mtu);
 
