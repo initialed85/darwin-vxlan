@@ -132,18 +132,15 @@ fn bridge_name_for_vni(vni: u32) -> Result<String> {
     Ok(format!("bridge{}", vni))
 }
 
-/// Reserve bridge units below the requested VNI. vmnet.framework does not
-/// provide an interface-name parameter; on macOS host-mode vmnet allocates
-/// bridge units starting at bridge100. Occupying the lower units causes the
-/// next allocation to be bridge<VNI>.
+/// Reserve bridge units below the requested VNI where vmnet's allocator can
+/// be coupled to the VNI. vmnet.framework does not provide an interface-name
+/// parameter; on macOS host-mode vmnet allocates bridge units starting at
+/// bridge100. For VNIs below bridge100, use the allocator-selected bridge and
+/// keep the requested VNI only in the VXLAN header.
 #[cfg(not(feature = "vmnet-mock"))]
 fn reserve_bridge_units(vni: u32) -> Result<BridgeReservations> {
     if vni < VMNET_BRIDGE_BASE {
-        anyhow::bail!(
-            "cannot force bridge{}: vmnet host-mode bridge allocation starts at bridge{}",
-            vni,
-            VMNET_BRIDGE_BASE
-        );
+        return Ok(BridgeReservations::empty());
     }
     if vni > VMNET_MAX_FORCED_VNI {
         anyhow::bail!(
@@ -216,9 +213,9 @@ impl VxlanTunnel {
 
         // macOS does not expose a supported vmnet option for choosing the
         // bridge name. Reserve the lower bridge units so vmnet's next
-        // automatically-created interface is bridge<VNI>. This is deliberately
-        // a small experiment-specific hack; reservations are removed on every
-        // exit path by BridgeReservations' Drop implementation.
+        // automatically-created interface is bridge<VNI> where possible. This
+        // is deliberately a small experiment-specific hack; reservations are
+        // removed on every exit path by BridgeReservations' Drop implementation.
         #[cfg(not(feature = "vmnet-mock"))]
         let _bridge_reservations = reserve_bridge_units(vni)?;
         #[cfg(feature = "vmnet-mock")]
@@ -247,7 +244,7 @@ impl VxlanTunnel {
         let bridge = wait_for_new_bridge(&bridges_before)?;
 
         #[cfg(not(feature = "vmnet-mock"))]
-        if bridge != desired_bridge {
+        if vni >= VMNET_BRIDGE_BASE && bridge != desired_bridge {
             anyhow::bail!(
                 "vmnet created {}, expected {} for VNI {}; another interface may have raced the bridge allocator",
                 bridge, desired_bridge, vni
@@ -316,6 +313,10 @@ impl VxlanTunnel {
         let bridge_name       = self.bridge_name.clone();
 
         let (eth_tx, mut eth_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        // The forwarding tasks must stop before VxlanTunnel is dropped. In
+        // particular, the UDP receive task holds the vmnet context pointer and
+        // would otherwise outlive the context after run_until() returns.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
         // vmnet → channel  (blocking thread: poll + vmnet_read)
         let blocking_handle = tokio::task::spawn_blocking(move || {
@@ -355,45 +356,64 @@ impl VxlanTunnel {
         });
 
         // channel → VXLAN → UDP  (async)
-        tokio::spawn(async move {
-            while let Some(eth_frame) = eth_rx.recv().await {
-                tracing::debug!("vmnet→vxlan: {} bytes", eth_frame.len());
-                let vxlan = build_vxlan_payload(&eth_frame, vni);
-                socket_tx.send_to(&vxlan, remote_addr).await.ok();
+        let tx_shutdown = shutdown_rx.clone();
+        let tx_handle = tokio::spawn(async move {
+            let mut shutdown = tx_shutdown;
+            loop {
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    maybe_frame = eth_rx.recv() => {
+                        let Some(eth_frame) = maybe_frame else { break };
+                        tracing::debug!("vmnet→vxlan: {} bytes", eth_frame.len());
+                        let vxlan = build_vxlan_payload(&eth_frame, vni);
+                        socket_tx.send_to(&vxlan, remote_addr).await.ok();
+                    }
+                }
             }
         });
 
         // UDP → VXLAN → vmnet  (async recv + sync vmnet_write)
-        tokio::spawn(async move {
+        let rx_handle = tokio::spawn(async move {
+            let mut shutdown = shutdown_rx;
             let mut buf = vec![0u8; 65535];
             loop {
-                match socket_rx.recv_from(&mut buf).await {
-                    Ok((len, src)) => {
-                        tracing::debug!("recv {} bytes from {}", len, src);
-                        // Recast after the await — *mut c_void must not cross await points.
-                        let ctx = ctx_write as *mut libc::c_void;
-                        vxlan_to_vmnet(&buf[..len], vni, ctx, &bridge_name);
-                    }
-                    Err(e) => {
-                        tracing::error!("UDP recv: {}", e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::select! {
+                    _ = shutdown.changed() => break,
+                    result = socket_rx.recv_from(&mut buf) => {
+                        match result {
+                            Ok((len, src)) => {
+                                tracing::debug!("recv {} bytes from {}", len, src);
+                                // Recast after the await — *mut c_void must not cross await points.
+                                let ctx = ctx_write as *mut libc::c_void;
+                                vxlan_to_vmnet(&buf[..len], vni, ctx, &bridge_name);
+                            }
+                            Err(e) => {
+                                tracing::error!("UDP recv: {}", e);
+                                tokio::select! {
+                                    _ = shutdown.changed() => break,
+                                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                                }
+                            }
+                        }
                     }
                 }
             }
         });
 
         tracing::info!("Tunnel running. Press Ctrl+C to stop.");
-        shutdown.await?;
+        // Always tear down the forwarding tasks, including when the shutdown
+        // future itself returns an error, before the vmnet context is dropped.
+        let shutdown_result = shutdown.await;
         tracing::info!("Shutting down.");
+        let _ = shutdown_tx.send(true);
 
         // Unblock the poll loop in the blocking thread so the runtime can finish.
         unsafe { libc::write(shutdown_write_fd, [1u8].as_ptr() as *const libc::c_void, 1); }
         let _ = blocking_handle.await;
-        // Give the forwarding task one scheduling turn to observe the channel
-        // close (eth_tx was dropped when the blocking thread exited) and exit
-        // its while loop cleanly.
-        tokio::task::yield_now().await;
+        let _ = tx_handle.await;
+        let _ = rx_handle.await;
 
+        shutdown_result?;
         Ok(())
     }
 
@@ -692,6 +712,11 @@ mod tests {
     }
 
     #[test]
+    fn bridge_name_accepts_flannel_vni() {
+        assert_eq!(bridge_name_for_vni(1).unwrap(), "bridge1");
+    }
+
+    #[test]
     fn bridge_name_accepts_maximum_vni() {
         assert_eq!(bridge_name_for_vni(VXLAN_MAX_VNI).unwrap(), "bridge16777215");
     }
@@ -907,6 +932,15 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn tunnel_new_binds_explicit_flannel_port() {
+            let t = VxlanTunnel::new(1, local(), remote(), 8472, 1450, None, None)
+                .await
+                .expect("new() should bind the requested port with mock backend");
+            assert_eq!(t.local_addr().unwrap().port(), 8472);
+            assert_eq!(t.remote_addr.port(), 8472);
+        }
+
+        #[tokio::test]
         async fn tunnel_new_fails_when_ctx_null() {
             // mock_start_fail is _Thread_local in C, so this only affects the
             // current OS thread — other parallel tests are unaffected.
@@ -993,6 +1027,20 @@ mod tests {
                 Ok(())
             }).await;
             assert!(result.is_ok(), "run_until() should return Ok: {:?}", result.err());
+        }
+
+        /// A shutdown error still cancels and joins the forwarding workers
+        /// before the tunnel is dropped.
+        #[tokio::test]
+        async fn tunnel_run_until_cleans_up_when_shutdown_fails() {
+            let tunnel = VxlanTunnel::new(1, local(), remote(), 0, 1450, None, None)
+                .await
+                .unwrap();
+
+            let result = tunnel.run_until(async {
+                Err(std::io::Error::other("test shutdown failure"))
+            }).await;
+            assert!(result.is_err());
         }
 
         /// Verify that `run()` delegates to `run_until(ctrl_c())`.

@@ -5,6 +5,8 @@ use clap::Parser;
 use std::net::IpAddr;
 use tracing_subscriber::{fmt, EnvFilter};
 
+const DEFAULT_VXLAN_PORT: u16 = 4789;
+
 #[derive(Parser, Debug)]
 #[command(name = "darwin-vxlan")]
 #[command(about = "Userspace L2 VXLAN tunnel for macOS (Apple Silicon)", long_about = None)]
@@ -18,7 +20,12 @@ struct Args {
     #[arg(long, help = "Remote peer IP address")]
     remote: IpAddr,
 
-    #[arg(long, default_value = "4789", help = "UDP port for VXLAN")]
+    #[arg(
+        long,
+        default_value_t = DEFAULT_VXLAN_PORT,
+        value_name = "PORT",
+        help = "UDP port for the local VXLAN listen/bind and remote peer destination (use 8472 for K3s Flannel)",
+    )]
     port: u16,
 
     #[arg(long, default_value = "1450", help = "MTU for the bridge interface")]
@@ -83,10 +90,21 @@ mod tests {
             "--local", "0.0.0.0", "--remote", "1.2.3.4",
         ]).unwrap();
         assert_eq!(a.vni, 100);
-        assert_eq!(a.port, 4789);  // default
+        assert_eq!(a.port, DEFAULT_VXLAN_PORT);  // default
         assert_eq!(a.mtu, 1450);   // default
         assert!(a.bridge_ipv4.is_none());
         assert!(a.bridge_ipv6.is_none());
+    }
+
+    #[test]
+    fn args_parse_flannel_port() {
+        let a = Args::try_parse_from([
+            "darwin-vxlan", "--vni", "1",
+            "--local", "192.168.1.10", "--remote", "192.168.1.11",
+            "--port", "8472",
+        ]).unwrap();
+        assert_eq!(a.vni, 1);
+        assert_eq!(a.port, 8472);
     }
 
     #[test]

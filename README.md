@@ -21,8 +21,8 @@ UDP :4789  ◄──── VXLAN/UDP ────►  UDP :4789
 
 - A thin C wrapper (`vmnet_bridge.c`) exposes `vmnet.framework`'s Objective-C/GCD API as plain C symbols that Rust FFI can call.
 - A pipe-based notification model avoids busy-polling: vmnet signals the pipe on packet arrival, Rust calls `poll(2)` on it.
-- Three concurrent tasks handle the data plane: a blocking thread drains vmnet reads, an async task forwards Ethernet frames → VXLAN → UDP, and a second async task receives UDP → VXLAN → vmnet.
-- Shutdown is coordinated through a second pipe: writing one byte unblocks the `poll(2)` loop, letting the blocking thread exit cleanly before the runtime stops.
+- Each `darwin-vxlan` process owns one vmnet host-mode interface and one UDP socket. Three concurrent data-plane workers run inside that process: a blocking thread drains vmnet reads, an async task forwards Ethernet frames → VXLAN → UDP, and a second async task receives UDP → VXLAN → vmnet.
+- Shutdown is coordinated through a second pipe and an async cancellation signal: writing one byte unblocks the `poll(2)` loop, and all forwarding workers are joined before the vmnet context is dropped.
 
 ## Requirements
 
@@ -93,7 +93,7 @@ darwin-vxlan --vni <VNI> --local <IP> --remote <IP> [OPTIONS]
 | `--vni` | _(required)_ | VXLAN Network Identifier |
 | `--local` | _(required)_ | Local IP address for the VXLAN UDP socket |
 | `--remote` | _(required)_ | Remote peer IP address |
-| `--port` | `4789` | UDP port |
+| `--port` | `4789` | UDP port used for both the local VXLAN listen/bind and the remote peer destination; use `8472` for K3s Flannel |
 | `--mtu` | `1450` | MTU for the bridge interface |
 | `--bridge-ipv4` | — | IPv4 CIDR to assign to the bridge (e.g. `192.168.100.1/24`) |
 | `--bridge-ipv6` | — | IPv6 CIDR to assign to the bridge (e.g. `fd00::1/64`) |
@@ -113,10 +113,11 @@ As a result:
 The temporary bridge devices are destroyed after vmnet starts. The requested
 bridge must not already exist, and bridge allocation must not race another
 program creating a bridge. This requires the same privileges as vmnet (run as
-root or use the vmnet entitlement). VNIs below 100 cannot be numbered this
-way because vmnet host-mode allocation starts at `bridge100` on the systems
-this experiment targets. The current allocator hack also refuses VNIs above
-4095 rather than creating thousands of temporary bridge devices.
+root or use the vmnet entitlement). For VNIs below 100, vmnet's
+allocator-selected bridge name is accepted because it cannot be coupled to
+`bridge<VNI>`; the VNI still remains in every VXLAN header. The current
+allocator hack also refuses VNIs above 4095 rather than creating thousands of
+temporary bridge devices.
 
 ### Example: point-to-point tunnel between two macOS hosts
 
@@ -133,6 +134,36 @@ sudo darwin-vxlan --vni 100 --local 10.0.0.2 --remote 10.0.0.1 --bridge-ipv4 192
 With `--vni 100`, both sides will have a `bridge100` interface with the assigned address. Traffic sent to `192.168.100.0/24` is encapsulated in VXLAN and forwarded over UDP between the two hosts.
 
 Press `Ctrl+C` to shut down.
+
+### Example: interoperate with K3s Flannel
+
+K3s Flannel's VXLAN backend uses VNI `1` and UDP port `8472` (rather than the
+standard VXLAN port `4789`). `--port` controls both the local UDP bind and the
+remote destination, so set it to `8472` for this interop:
+
+```sh
+sudo darwin-vxlan \
+  --vni 1 \
+  --local 192.168.1.128 \
+  --remote 192.168.1.111 \
+  --port 8472 \
+  --bridge-ipv4 10.42.0.250/16
+```
+
+Use an address and bridge CIDR appropriate for the macOS host and the Flannel
+node. The VNI is carried in every VXLAN header; for VNI `1`, vmnet uses its
+allocator-selected bridge name because host-mode bridge numbering starts at
+`bridge100`.
+
+### Process concurrency
+
+A process is currently a single point-to-point VXLAN endpoint: it has one
+`--remote` destination and one local UDP bind. Running another process with the
+same local address and UDP port will fail with an address-in-use error. Multiple
+processes are possible only when they use distinct local bind addresses/ports,
+and vmnet bridge allocation must not race between processes. To reach multiple
+Flannel peers, use a design that provides peer fan-out rather than starting
+several processes on the same `--port 8472`.
 
 ## Testing
 
