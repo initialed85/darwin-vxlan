@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to build (e.g., 0.1.0)'
+        description: 'Version to build (e.g., 0.1.3)'
         required: true
         type: string
 
@@ -25,8 +25,23 @@ env:
 
 jobs:
   build:
-    name: Build ARM64
-    runs-on: macos-latest
+    name: Build ${{ matrix.asset }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            asset: aarch64-apple-darwin
+            binary_arch: arm64
+            deployment_target: '11.0'
+          - target: x86_64-apple-darwin
+            asset: x86_64-apple-darwin
+            binary_arch: x86_64
+            deployment_target: '10.15'
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+      CFLAGS: '-Werror=unguarded-availability-new'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -34,17 +49,14 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Verify architecture
         run: |
-          file target/aarch64-apple-darwin/release/darwin-vxlan | grep -q "arm64" || {
-            echo "ERROR: Binary is not ARM64"
-            exit 1
-          }
+          file target/${{ matrix.target }}/release/darwin-vxlan | grep -q '${{ matrix.binary_arch }}'
 
       - name: Create tarball
         run: |
@@ -61,27 +73,40 @@ jobs:
           echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
 
           mkdir -p dist
-          cp target/aarch64-apple-darwin/release/darwin-vxlan dist/
-          cp README.md dist/ || true
+          cp target/${{ matrix.target }}/release/darwin-vxlan dist/
+          cp README.md dist/
 
           cd dist
-          tar -czf darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan README.md
+          tar -czf darwin-vxlan-${{ matrix.asset }}.tar.gz darwin-vxlan README.md
           cd ..
 
           echo "==> Created tarball:"
-          ls -lh dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
+          ls -lh dist/darwin-vxlan-${{ matrix.asset }}.tar.gz
 
       - name: Upload tarball artifact
         uses: actions/upload-artifact@v4
         with:
-          name: tarball
-          path: dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
+          name: tarball-${{ matrix.asset }}
+          path: dist/darwin-vxlan-${{ matrix.asset }}.tar.gz
           retention-days: 3
 
   package:
-    name: Create .pkg
+    name: Package ${{ matrix.asset }}
     needs: build
-    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            asset: aarch64-apple-darwin
+            deployment_target: '11.0'
+          - target: x86_64-apple-darwin
+            asset: x86_64-apple-darwin
+            deployment_target: '10.15'
+    runs-on: macos-14
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+      CFLAGS: '-Werror=unguarded-availability-new'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -89,7 +114,7 @@ jobs:
       - name: Download tarball artifact
         uses: actions/download-artifact@v4
         with:
-          name: tarball
+          name: tarball-${{ matrix.asset }}
           path: dist/
 
       - name: Derive VERSION
@@ -108,9 +133,9 @@ jobs:
 
       - name: Extract binary from tarball
         run: |
-          cd dist
-          tar -xzf darwin-vxlan-aarch64-apple-darwin.tar.gz
-          ls -la
+          mkdir -p dist/${{ matrix.asset }}
+          tar -xzf dist/darwin-vxlan-${{ matrix.asset }}.tar.gz -C dist/${{ matrix.asset }}
+          ls -la dist/${{ matrix.asset }}
 
       - name: Make build script executable
         run: chmod +x scripts/build-pkg.sh
@@ -118,15 +143,16 @@ jobs:
       - name: Build .pkg
         run: |
           ./scripts/build-pkg.sh \
-            dist/darwin-vxlan \
-            ${{ env.VERSION }} \
-            dist/
+            dist/${{ matrix.asset }}/darwin-vxlan \
+            "$VERSION" \
+            dist/${{ matrix.asset }} \
+            "${{ matrix.asset }}"
 
       - name: Upload .pkg artifact
         uses: actions/upload-artifact@v4
         with:
-          name: pkg
-          path: dist/*.pkg
+          name: pkg-${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}/darwin-vxlan-*.pkg
           retention-days: 3
 
   release:
@@ -136,17 +162,19 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download tarball artifact
+      - name: Download tarballs
         uses: actions/download-artifact@v4
         with:
-          name: tarball
+          pattern: tarball-*
           path: dist/
+          merge-multiple: true
 
-      - name: Download .pkg artifact
+      - name: Download packages
         uses: actions/download-artifact@v4
         with:
-          name: pkg
+          pattern: pkg-*
           path: dist/
+          merge-multiple: true
 
       - name: Derive VERSION
         run: |
@@ -165,7 +193,7 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          sha256sum darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan-*.pkg > sha256sums.txt
+          sha256sum darwin-vxlan-*.tar.gz darwin-vxlan-*.pkg > sha256sums.txt
           echo "==> Checksums:"
           cat sha256sums.txt
 
@@ -177,37 +205,26 @@ jobs:
           body: |
             ## Installation
 
-            ### Via Homebrew
-            A Homebrew formula is not currently published for this fork.
-
-            ### Manual installation
+            ### Apple Silicon
             ```bash
-            # Download and extract
             curl -L https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz
-
-            # Move to PATH
             sudo mv darwin-vxlan /usr/local/bin/
-
-            # Allow execution (Gatekeeper)
-            xattr -d com.apple.quarantine /usr/local/bin/darwin-vxlan
-
-            # Verify
-            darwin-vxlan --help
             ```
 
-            ### Using the .pkg installer
+            ### Intel / Catalina and newer
             ```bash
-            # Download the .pkg
-            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/darwin-vxlan-${{ env.VERSION }}.pkg
-
-            # Install (requires sudo)
-            sudo installer -pkg darwin-vxlan-${{ env.VERSION }}.pkg -target /
+            curl -L https://github.com/${{ github.repository }}/releases/download/v${{ env.VERSION }}/darwin-vxlan-x86_64-apple-darwin.tar.gz | tar xz
+            sudo mv darwin-vxlan /usr/local/bin/
             ```
+
+            ### Installer packages
+            Architecture-specific `.pkg` installers are included for both
+            `aarch64-apple-darwin` and `x86_64-apple-darwin`.
 
             ### Checksums
             See `sha256sums.txt` for verification.
           files: |
-            dist/darwin-vxlan-aarch64-apple-darwin.tar.gz
+            dist/darwin-vxlan-*.tar.gz
             dist/darwin-vxlan-*.pkg
             dist/sha256sums.txt
           draft: false

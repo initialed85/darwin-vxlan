@@ -62,8 +62,9 @@ A Homebrew formula is not currently published for this fork.
 
 ### Manual installation
 ```bash
-# Download the latest release
+# Download the latest Apple Silicon release
 curl -L https://github.com/initialed85/darwin-vxlan/releases/latest/download/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz
+# Intel users: use darwin-vxlan-x86_64-apple-darwin.tar.gz instead
 
 # Move to PATH
 sudo mv darwin-vxlan /usr/local/bin/
@@ -77,21 +78,22 @@ darwin-vxlan --help
 
 ### Using the .pkg installer
 ```bash
-# Set this to the release version you want to install.
-VERSION=0.1.0
-curl -LO "https://github.com/initialed85/darwin-vxlan/releases/download/v${VERSION}/darwin-vxlan-${VERSION}.pkg"
+# Set this to the release version and architecture you want to install.
+VERSION=0.1.3
+ARCH=aarch64-apple-darwin  # Intel: x86_64-apple-darwin
+curl -LO "https://github.com/initialed85/darwin-vxlan/releases/download/v${VERSION}/darwin-vxlan-${VERSION}-${ARCH}.pkg"
 
 # Install (requires sudo)
-sudo installer -pkg "darwin-vxlan-${VERSION}.pkg" -target /
+sudo installer -pkg "darwin-vxlan-${VERSION}-${ARCH}.pkg" -target /
 ```
 
 ## Releases
 
-The release workflow builds the Apple Silicon tarball and `.pkg` installer when a
-`v*` tag is pushed. Pull-request CI additionally formats, tests with the vmnet
-stub, and cross-builds the Intel target for Catalina; hosted CI cannot start a
-real vmnet interface because root/entitlement and a macOS host network are
-required. To publish a release from this fork:
+The release workflow builds Apple Silicon and Intel tarballs and architecture-
+specific `.pkg` installers when a `v*` tag is pushed. Pull-request CI additionally
+formats, tests with the vmnet stub, and cross-builds the Intel target for Catalina;
+hosted CI cannot start a real vmnet interface because root/entitlement and a
+macOS host network are required. To publish a release from this fork:
 
 ```sh
 git tag v0.1.0

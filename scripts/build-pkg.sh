@@ -1,14 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: ./scripts/build-pkg.sh [binary_path] [version] [output_dir]
-# Example: ./scripts/build-pkg.sh target/release/darwin-vxlan 0.1.0 dist/
+# Usage: ./scripts/build-pkg.sh [binary_path] [version] [output_dir] [arch_tag]
+# Example: ./scripts/build-pkg.sh target/release/darwin-vxlan 0.1.0 dist/ arm64
 
 BINARY_PATH="${1:-target/release/darwin-vxlan}"
 VERSION="${2:-$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')}"
 OUTPUT_DIR="${3:-dist}"
+ARCH_TAG="${4:-}"
 IDENTIFIER="com.initialed85.darwin-vxlan"
 PACKAGE_NAME="darwin-vxlan"
+PACKAGE_SUFFIX=""
+if [ -n "${ARCH_TAG}" ]; then
+    PACKAGE_SUFFIX="-${ARCH_TAG}"
+fi
 
 echo "==> Building .pkg for ${PACKAGE_NAME} v${VERSION}"
 
@@ -59,7 +64,7 @@ cat > "${STAGING_DIR}/Distribution.xml" << EOF
     <choice id="choice1" title="${PACKAGE_NAME}">
         <pkg-ref id="${IDENTIFIER}"/>
     </choice>
-    <pkg-ref id="${IDENTIFIER}" version="${VERSION}">${PACKAGE_NAME}-${VERSION}.pkg</pkg-ref>
+    <pkg-ref id="${IDENTIFIER}" version="${VERSION}">${PACKAGE_NAME}-${VERSION}${PACKAGE_SUFFIX}.pkg</pkg-ref>
 </installer-gui-script>
 EOF
 
@@ -68,22 +73,24 @@ INSTALLED_SIZE=$(du -sk "${STAGING_DIR}/usr" | cut -f1)
 sed -i '' "s/numberOfKilobytes=\"0\"/numberOfKilobytes=\"${INSTALLED_SIZE}\"/" "${STAGING_DIR}/PackageInfo"
 
 # Build component package
+INTERNAL_PACKAGE="${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}${PACKAGE_SUFFIX}-internal.pkg"
+OUTPUT_PACKAGE="${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}${PACKAGE_SUFFIX}.pkg"
 echo "==> Building component package..."
 pkgbuild --root "${STAGING_DIR}" \
          --identifier "${IDENTIFIER}" \
          --version "${VERSION}" \
          --install-location / \
          --ownership recommended \
-         "${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}-internal.pkg"
+         "${INTERNAL_PACKAGE}"
 
 # Build product package
 echo "==> Building product package..."
 productbuild --distribution "${STAGING_DIR}/Distribution.xml" \
-             --package-path "${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}-internal.pkg" \
-             "${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}.pkg"
+             --package-path "${INTERNAL_PACKAGE}" \
+             "${OUTPUT_PACKAGE}"
 
 # Clean up internal package
-rm -f "${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}-internal.pkg"
+rm -f "${INTERNAL_PACKAGE}"
 
-echo "==> Package created: ${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}.pkg"
-echo "==> Size: $(du -h "${OUTPUT_DIR}/${PACKAGE_NAME}-${VERSION}.pkg" | cut -f1)"
+echo "==> Package created: ${OUTPUT_PACKAGE}"
+echo "==> Size: $(du -h "${OUTPUT_PACKAGE}" | cut -f1)"
