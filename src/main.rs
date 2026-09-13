@@ -67,7 +67,7 @@ impl FromStr for PeerSpec {
 
 #[derive(Parser, Debug)]
 #[command(name = "darwin-vxlan")]
-#[command(about = "Userspace L2 VXLAN tunnel for macOS (Apple Silicon)", long_about = None)]
+#[command(about = "Userspace L2 VXLAN tunnel for macOS (Intel and Apple Silicon)", long_about = None)]
 struct Args {
     #[arg(long, help = "VXLAN Network Identifier (VNI)")]
     vni: u32,

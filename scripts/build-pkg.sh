@@ -12,7 +12,7 @@ PACKAGE_NAME="darwin-vxlan"
 
 echo "==> Building .pkg for ${PACKAGE_NAME} v${VERSION}"
 
-# Verify binary exists and is ARM64
+# Verify binary exists and is a supported macOS architecture
 if [ ! -f "${BINARY_PATH}" ]; then
     echo "ERROR: Binary not found at ${BINARY_PATH}"
     echo "Run 'cargo build --release' first."
@@ -20,9 +20,10 @@ if [ ! -f "${BINARY_PATH}" ]; then
 fi
 
 ARCH=$(file "${BINARY_PATH}" | grep -o "arm64\|x86_64")
-if [ "${ARCH}" != "arm64" ]; then
-    echo "WARNING: Binary architecture is ${ARCH}, expected arm64"
-fi
+case "${ARCH}" in
+    arm64|x86_64) ;;
+    *) echo "WARNING: Binary architecture is ${ARCH}, expected arm64 or x86_64" ;;
+esac
 
 # Create staging directory
 STAGING_DIR=$(mktemp -d)

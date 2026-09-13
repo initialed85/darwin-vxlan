@@ -1,6 +1,6 @@
 # darwin-vxlan
 
-Userspace L2 VXLAN tunnel for macOS (Apple Silicon).
+Userspace L2 VXLAN tunnel for macOS (Intel and Apple Silicon).
 
 Bridges two hosts at the Ethernet layer over UDP using [RFC 7348](https://datatracker.ietf.org/doc/html/rfc7348) VXLAN encapsulation. Packet I/O goes through Apple's `vmnet.framework` (host-only mode), which creates a real `bridge` interface without kernel extensions or third-party drivers.
 
@@ -26,9 +26,16 @@ UDP :4789  ◄──── VXLAN/UDP ────►  UDP :4789
 
 ## Requirements
 
-- macOS (Apple Silicon)
+- macOS 10.15 Catalina or newer (Intel `x86_64` and Apple Silicon `arm64`)
 - Root privileges or the `com.apple.vm.networking` entitlement
 - Rust toolchain (edition 2024)
+
+The core vmnet APIs used by darwin-vxlan (`VMNET_HOST_MODE`, interface start,
+packet read/write, and stop) are available on macOS 10.10 and newer. On macOS
+11 and newer, the wrapper also requests a fresh per-process vmnet network UUID
+so bridge ownership is isolated. Catalina has no network-identifier API, so the
+wrapper falls back to ordinary host-mode allocation there; do not run multiple
+tunnels that depend on isolated bridge ownership on Catalina.
 
 ## Build
 
@@ -37,6 +44,16 @@ cargo build --release
 ```
 
 The build script compiles `src/vmnet_bridge.c` and links `vmnet.framework` automatically.
+For an Intel/Catalina-compatible binary built on a newer Mac, select the Intel
+target and deployment minimum explicitly:
+
+```sh
+MACOSX_DEPLOYMENT_TARGET=10.15 \
+  cargo build --release --target x86_64-apple-darwin
+```
+
+The resulting binary can be checked with `file` and `otool -l`; CI performs
+this cross-build and verifies a Mach-O `x86_64` binary with minimum OS 10.15.
 
 ## Installation
 
@@ -71,7 +88,10 @@ sudo installer -pkg "darwin-vxlan-${VERSION}.pkg" -target /
 ## Releases
 
 The release workflow builds the Apple Silicon tarball and `.pkg` installer when a
-`v*` tag is pushed. To publish a release from this fork:
+`v*` tag is pushed. Pull-request CI additionally formats, tests with the vmnet
+stub, and cross-builds the Intel target for Catalina; hosted CI cannot start a
+real vmnet interface because root/entitlement and a macOS host network are
+required. To publish a release from this fork:
 
 ```sh
 git tag v0.1.0

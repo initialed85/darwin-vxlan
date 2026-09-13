@@ -36,6 +36,20 @@ typedef struct {
 } vmnet_ctx_t;
 
 /*
+ * vmnet_network_identifier_key was added in macOS 11. Keep the symbol out of
+ * builds made with an older SDK, and guard the runtime access when compiling
+ * with a newer SDK for an older deployment target (such as Catalina).
+ */
+static const char *network_identifier_key_if_available(void) {
+#if defined(__MAC_OS_X_VERSION_MAX_ALLOWED) && __MAC_OS_X_VERSION_MAX_ALLOWED >= 110000
+    if (__builtin_available(macOS 11.0, *)) {
+        return vmnet_network_identifier_key;
+    }
+#endif
+    return NULL;
+}
+
+/*
  * Start a vmnet interface in HOST_ONLY mode.
  * Returns a heap-allocated context on success, NULL on failure.
  * Must be called as root (or with com.apple.vm.networking entitlement).
@@ -62,14 +76,21 @@ vmnet_ctx_t *vmnet_ctx_start(uint32_t requested_mtu) {
 
     /*
      * A host-mode interface without a network identifier can be attached to
-     * an existing vmnet host network. Request a fresh, isolated network for
-     * this process so bridge discovery cannot mistake another tunnel's
-     * bridge for the interface created here. vmnet expects a UUID XPC value,
-     * not a string or generic data object.
+     * an existing vmnet host network. On macOS 11+, request a fresh isolated
+     * network for this process so bridge discovery cannot mistake another
+     * tunnel's bridge for the interface created here. vmnet expects a UUID
+     * XPC value, not a string or generic data object.
+     *
+     * Catalina (10.15) has no network-identifier key. It can still run the
+     * basic host-mode tunnel, but vmnet bridge ownership/isolation is weaker
+     * there and must not be assumed for concurrent tunnel processes.
      */
-    uuid_t network_id;
-    uuid_generate_random(network_id);
-    xpc_dictionary_set_uuid(params, vmnet_network_identifier_key, network_id);
+    const char *network_key = network_identifier_key_if_available();
+    if (network_key) {
+        uuid_t network_id;
+        uuid_generate_random(network_id);
+        xpc_dictionary_set_uuid(params, network_key, network_id);
+    }
 
     if (requested_mtu > 0)
         xpc_dictionary_set_uint64(params, vmnet_mtu_key, requested_mtu);
