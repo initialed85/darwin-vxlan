@@ -10,11 +10,14 @@
 # valueFrom source`, and it took the lane down until it was reverted. Volume mounts are inert here too.
 #
 # What is left is the host: steps are child processes of the agent (local.go builds cmd.Env from
-# os.Environ()) and they see the host filesystem. So this measures whether the agent user's gh is already
-# authenticated, what HOME the step gets, and whether the host user's gh config is reachable from inside the
-# agent's view of the filesystem.
+# os.Environ()) and they see the host filesystem. Measured on run 7: gh 2.96.0 is on PATH and NOT
+# authenticated - no GH_TOKEN, `You are not logged into any GitHub hosts`, and `gh api` answers `To use
+# GitHub CLI in automation, set the GH_TOKEN environment variable`. So a darwin release step has no
+# credential today. This run measures who a step runs as, what HOME it gets, and whether a file under the
+# agent's own config directory - the route WOODPECKER_AGENT_SECRET_FILE already uses - is reachable from a
+# step, which is the only way left to hand this lane a GitHub token.
 #
-# Presence and identity only - never a token value.
+# Presence, identity and permissions only - never a token value.
 labels:
   platform: darwin/arm64
 
@@ -33,11 +36,16 @@ steps:
       - echo token presence checks, value never printed
       - env | awk 'BEGIN{a=0;b=0} /^GH_TOKEN=/{a=1} /^GITHUB_TOKEN=/{b=1} END{print "GH_TOKEN present", a, "GITHUB_TOKEN present", b}'
       - gh --version | head -1
-      - gh auth status 2>&1 | head -8
-      - gh api repos/initialed85/darwin-vxlan --jq .full_name
+      # Kept non-fatal: on run 7 the step died on `gh api` under set -e before the path checks below ran.
+      - gh auth status 2>&1 | head -4 || true
+      - gh api repos/initialed85/darwin-vxlan --jq .full_name 2>&1 | head -2 || true
       - env | awk '/^HOME=/{print "HOME line", $0}'
+      - printf 'step runs as %s uid %s\n' "$(id -u -n)" "$(id -u)"
       - test -f "$HOME/.config/gh/hosts.yml" && echo "gh config visible at HOME/.config/gh/hosts.yml" || echo "no gh config at HOME/.config/gh/hosts.yml"
       - test -f /Users/edwardbeech/.config/gh/hosts.yml && echo "gh config visible at the host path" || echo "no gh config at the host path"
+      # The agent reads its own token from this host path (WOODPECKER_AGENT_SECRET_FILE in the Deployment).
+      # If a step can stat the same directory, a GitHub credential can reach a darwin step the same way.
+      - ls -l /Users/edwardbeech/.config/woodpecker-agent/ 2>&1 | head -5 || echo "step cannot see the agent config directory"
       - test -f /Users/edwardbeech/.config/woodpecker-agent/agent-secret && echo "agent secret host path is readable from a step" || echo "agent secret host path NOT readable from a step"
 
 when:
