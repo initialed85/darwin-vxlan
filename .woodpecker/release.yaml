@@ -1,0 +1,120 @@
+# GitHub Release on a v* tag push. This is the port of .github/workflows/release.yml (deleted in the same
+# commit) and it runs on the darwin agent, the only machine that can build this repo at all - vmnet.framework
+# is a macOS SDK header and pkgbuild is a macOS tool.
+#
+# Four things differ from GitHub Actions, and each difference is deliberate.
+#
+# 1. One arch. The Actions matrix built aarch64-apple-darwin (deployment target 11.0) and
+#    x86_64-apple-darwin (deployment target 10.15, Catalina). The Intel half is gone: the old Intel MacBook
+#    never came back up, so the x86_64 binary and its .pkg were cross-compiled output that nothing had ever
+#    executed, and building them costs time on the single Apple Silicon host - the same host the vxlan
+#    functional tests queue behind. ci.yaml dropped its Catalina leg in the same sweep. The install notes
+#    only advertise arm64 now, because notes describing an artifact that is not on the release would be a
+#    worse user experience than a narrower release.
+#
+# 2. The build, package and publish steps are sequential steps of one workflow, not three jobs joined by
+#    upload-artifact/download-artifact. They share a workspace, so dist/ written by the build step is simply
+#    there for the next one. A Woodpecker matrix would multiply the whole workflow, which for a release
+#    means publishing more than once.
+#
+# 3. Publishing uses gh, not a release plugin. softprops/action-gh-release is a Docker plugin and the darwin
+#    agent runs the local backend, which turns `image:` into a host shell and cannot resolve settings with
+#    from_secret. gh 2.96.0 is on the host. It starts unauthenticated - the probe measured `You are not
+#    logged into any GitHub hosts` - and the local backend points HOME at a per-workflow directory, so a host
+#    `gh auth login` could never be seen by a step even if one were run. The credential therefore arrives as
+#    GH_TOKEN, taken from the agent pod's environment once a maclet build containing Ed's commit 1682606
+#    (resolve env valueFrom secretKeyRef) is running on icarus-2.local, or from the host file
+#    /Users/edwardbeech/.config/woodpecker-agent/github-token otherwise - 40 bytes, no trailing newline,
+#    mode 600, owned by the uid the steps run as. The step uses whichever exists, never prints it, and the
+#    fallback is repeated in every step that calls gh because step environment does not carry forward.
+#
+# 4. The tag already exists. Actions created the release against the tag that triggered it, and so does
+#    this: CI_COMMIT_TAG is that tag, so there is no ref to create here, unlike macgrubernetes where the
+#    build-N tag is minted by the pipeline. The version for the .pkg and the notes is the tag minus its leading
+#    v, derived with sed rather than a shell substring expansion because Woodpecker runs envsubst over the
+#    raw file, comments included, and a brace it cannot parse fails the whole workflow before a step runs.
+
+labels:
+  platform: darwin/arm64
+
+steps:
+  - name: version
+    image: bash
+    commands:
+      # CI_COMMIT_TAG is refs/tags/<tag> reduced by the server to the tag name, so v0.1.4 -> 0.1.4.
+      - echo "$CI_COMMIT_TAG" | sed 's#^v##' > .release-version.txt
+      # an empty version is how a release gets published against the wrong name, so it stops here
+      - test -s .release-version.txt
+      - echo "releasing darwin-vxlan $(cat .release-version.txt) from tag $CI_COMMIT_TAG"
+
+  - name: build
+    image: bash
+    depends_on: [version]
+    commands:
+      - rustc --version
+      - cargo --version
+      - rustup target add aarch64-apple-darwin
+      # 11.0 is what the arm64 matrix entry asked for, and the flag turns an accidental availability
+      # regression into a build failure instead of a binary that crashes on an older point release.
+      - env MACOSX_DEPLOYMENT_TARGET=11.0 CFLAGS=-Werror=unguarded-availability-new cargo build --release --target aarch64-apple-darwin
+      # Actions used file(1), which exists on this host; the assertion is the same one, so a binary built for
+      # the wrong target cannot reach a user as an arm64 artifact.
+      - file target/aarch64-apple-darwin/release/darwin-vxlan | grep -q 'Mach-O 64-bit executable arm64'
+      - mkdir -p dist/aarch64-apple-darwin
+      # the tarball's layout matches the Actions one - binary and README at the root - because the install
+      # instructions are `curl ... | tar xz` followed by moving darwin-vxlan out of the current directory.
+      - cp target/aarch64-apple-darwin/release/darwin-vxlan dist/aarch64-apple-darwin/
+      - cp README.md dist/aarch64-apple-darwin/
+      - tar -C dist/aarch64-apple-darwin -czf dist/darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan README.md
+      - ls -l dist
+
+  - name: package
+    image: bash
+    depends_on: [build]
+    commands:
+      # Actions extracted the binary from the tarball before packaging purely because the artifact hop put it
+      # there; the build step already staged it, so the round trip is gone and the pkgbuild input directory
+      # is identical.
+      - chmod +x scripts/build-pkg.sh
+      - ./scripts/build-pkg.sh dist/aarch64-apple-darwin/darwin-vxlan "$(cat .release-version.txt)" dist/aarch64-apple-darwin aarch64-apple-darwin
+      - mv dist/aarch64-apple-darwin/darwin-vxlan-*.pkg dist/
+      - ls -l dist
+
+  - name: release
+    image: bash
+    depends_on: [package]
+    commands:
+      - test -n "$GH_TOKEN" || export GH_TOKEN=$(cat /Users/edwardbeech/.config/woodpecker-agent/github-token)
+      # checksums over the uploaded names, run from inside dist/, exactly as the Actions job did
+      - cd dist && sha256sum darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan-*.pkg > sha256sums.txt
+      - ls -l dist
+      - |
+        PREVIOUS=$(git tag --list 'v*' --sort=-v:refname | sed -n 2p)
+        {
+          echo "## Installation"
+          echo
+          echo "### Apple Silicon"
+          echo
+          echo '```bash'
+          echo "curl -L https://github.com/$CI_REPO/releases/download/$CI_COMMIT_TAG/darwin-vxlan-aarch64-apple-darwin.tar.gz | tar xz"
+          echo 'sudo mv darwin-vxlan /usr/local/bin/'
+          echo '```'
+          echo
+          echo "The \`darwin-vxlan-*.pkg\` installer on this release does the same thing with a receipt, and"
+          echo "\`sha256sums.txt\` covers both artifacts."
+          echo
+          if [ -n "$PREVIOUS" ]; then
+            echo "### Changes since $PREVIOUS"
+            echo
+            echo "https://github.com/$CI_REPO/compare/$PREVIOUS...$CI_COMMIT_TAG"
+          fi
+        } > dist/NOTES.md
+      # --notes-file replaces the generated notes rather than adding to them, hence the compare link by hand.
+      # softprops appended GitHub's note block to a custom body; gh has no equivalent, and the commit range is
+      # the part of those notes anyone actually read.
+      - gh release create "$CI_COMMIT_TAG" dist/darwin-vxlan-aarch64-apple-darwin.tar.gz dist/darwin-vxlan-*.pkg dist/sha256sums.txt --title "darwin-vxlan $(cat .release-version.txt)" --notes-file dist/NOTES.md
+      - gh release view "$CI_COMMIT_TAG" --json tagName,assets --jq '"tag " + .tagName + " assets " + (.assets | length | tostring) + " " + (.assets | map(.name) | join(" "))'
+
+when:
+  - event: tag
+    ref: [refs/tags/v*]
