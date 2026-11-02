@@ -9,7 +9,9 @@
 #    environment should be visible to steps. If true, the token can live on the Mac agent and a script step
 #    can use it.
 #
-# Presence and length only - never the value.
+# Presence and length only - never the value. Result of the GH_TOKEN run: maclet resolves valueFrom
+# secretKeyRef for a pod on this node, the step inherits GH_TOKEN from the agent process, and gh is
+# therefore authenticated on the darwin lane without any workflow naming a credential.
 labels:
   platform: darwin/arm64
 
@@ -26,7 +28,10 @@ steps:
           else printf 'MISSING %s\n' "$c"; fi
         done
       - echo token presence checks, value never printed
-      - env | awk 'BEGIN{a=0;b=0} /^PLUGIN_TOKEN=/{a=1} /^GITHUB_TOKEN=/{b=1} END{print "PLUGIN_TOKEN present", a, "GITHUB_TOKEN present", b}'
+      - env | awk 'BEGIN{a=0;b=0} /^GH_TOKEN=/{a=1} /^GITHUB_TOKEN=/{b=1} END{print "GH_TOKEN present", a, "GITHUB_TOKEN present", b}'
+      - gh --version | head -1
+      - gh auth status 2>&1 | head -8
+      - gh api repos/initialed85/darwin-vxlan --jq .full_name
       - env | awk '/^HOME=/{print "HOME line", $0}'
 
 when:
