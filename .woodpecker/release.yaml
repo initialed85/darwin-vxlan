@@ -85,8 +85,11 @@ steps:
     depends_on: [package]
     commands:
       - test -n "$GH_TOKEN" || export GH_TOKEN=$(cat /Users/edwardbeech/.config/woodpecker-agent/github-token)
-      # checksums over the uploaded names, run from inside dist/, exactly as the Actions job did
-      - cd dist && sha256sum darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan-*.pkg > sha256sums.txt
+      # checksums over the uploaded names, run from inside dist/, exactly as the Actions job did. The
+      # subshell matters: the commands of one step share a single shell, so a bare cd here leaks into every
+      # later command - darwin-vxlan #11 published nothing because its next line was ls -l dist and the
+      # shell was already in dist/, looking for dist/dist.
+      - (cd dist && sha256sum darwin-vxlan-aarch64-apple-darwin.tar.gz darwin-vxlan-*.pkg > sha256sums.txt)
       - ls -l dist
       - |
         PREVIOUS=$(git tag --list 'v*' --sort=-v:refname | sed -n 2p)
