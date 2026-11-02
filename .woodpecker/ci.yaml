@@ -17,8 +17,13 @@
 # the Mac the only agent that can take the task. It is also exactly what the docs describe for workflow
 # labels, minus the fact that the docs claim a `platform` attribute exists.
 #
-# The runner is icarus-2.local: backend `local`, capacity 1, so `image:` is ignored and the commands run
-# in a shell on the Mac itself. cargo, rustup, `file` and `otool` are host tools, not container ones.
+# The runner is icarus-2.local: backend `local`, capacity 1. The local backend does not run containers -
+# it uses the step's `image` as the NAME OF THE SHELL to run the commands in (pipeline/backend/local/
+# command.go: "execCommands use step.Image as shell"; genCmdByShell accepts sh, bash and zsh, and probes
+# anything else as a posix shell). So `image: docker.io/library/rust:1.99.1` on a Mac step fails with
+# `exec: "docker.io/library/rust:1.99.1": stat ...: no such file or directory`, which is exactly how this
+# workflow failed on its first run. The image is a shell name here, and cargo/rustup/file/otool are host
+# tools on icarus, not container ones.
 #
 # Ported from .github/workflows/ci.yml, which this replaces. Both jobs are kept, including the
 # deployment-target assertions, because those are what stop the Intel/Catalina build silently
@@ -29,7 +34,7 @@ labels:
 
 steps:
   - name: check
-    image: docker.io/library/rust:1.99.1
+    image: bash
     commands:
       - rustc --version
       - cargo fmt -- --check
@@ -39,7 +44,7 @@ steps:
       - cargo check --all-features
 
   - name: x86_64-catalina
-    image: docker.io/library/rust:1.99.1
+    image: bash
     environment:
       # 10.15 is the promise this repo makes about Intel Macs, and the flag makes the compiler fail the
       # build instead of quietly emitting a binary that would crash on Catalina.
