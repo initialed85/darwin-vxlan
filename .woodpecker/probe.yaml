@@ -1,17 +1,20 @@
-# Throwaway probe (deleted once answered). Two questions block a Mac-side GitHub Release:
+# Throwaway probe (deleted once answered). One question now blocks every darwin release workflow: can a
+# step on this lane authenticate to GitHub at all?
 #
-# 1. v3 has no top-level `secrets:` key, and a named Secret reaches a workflow only through a plugin step's
-#    settings: {from_secret: name} (compiler/settings/params.go:179, compiler/convert.go:106). A
-#    plugin-shaped step cannot execute on the local backend, which is what maclet runs. So how can a
-#    darwin/arm64 step get a GitHub token at all?
-# 2. The local backend runs steps as child processes of the agent (pipeline/backend/local/local.go builds
-#    cmd.Env from os.Environ() plus the step's own vars), so anything in maclet's own LaunchServices
-#    environment should be visible to steps. If true, the token can live on the Mac agent and a script step
-#    can use it.
+# The cluster-side answers are all closed. v3 has no top-level secrets: key, and a named Secret reaches a
+# workflow only through a plugin step's settings: {from_secret: name} (compiler/settings/params.go:179 via
+# compiler/convert.go:106); a plugin-shaped step cannot run on the local backend because image: resolves to
+# a shell; backend_options.kubernetes.secrets has nothing to attach to because this lane has no step pods.
+# The last option - GH_TOKEN on the agent Deployment via secretKeyRef - was applied and measured: maclet
+# refuses it, the pod goes to RunContainerError with `environment variable "GH_TOKEN" uses an unsupported
+# valueFrom source`, and it took the lane down until it was reverted. Volume mounts are inert here too.
 #
-# Presence and length only - never the value. Result of the GH_TOKEN run: maclet resolves valueFrom
-# secretKeyRef for a pod on this node, the step inherits GH_TOKEN from the agent process, and gh is
-# therefore authenticated on the darwin lane without any workflow naming a credential.
+# What is left is the host: steps are child processes of the agent (local.go builds cmd.Env from
+# os.Environ()) and they see the host filesystem. So this measures whether the agent user's gh is already
+# authenticated, what HOME the step gets, and whether the host user's gh config is reachable from inside the
+# agent's view of the filesystem.
+#
+# Presence and identity only - never a token value.
 labels:
   platform: darwin/arm64
 
@@ -33,6 +36,9 @@ steps:
       - gh auth status 2>&1 | head -8
       - gh api repos/initialed85/darwin-vxlan --jq .full_name
       - env | awk '/^HOME=/{print "HOME line", $0}'
+      - test -f "$HOME/.config/gh/hosts.yml" && echo "gh config visible at HOME/.config/gh/hosts.yml" || echo "no gh config at HOME/.config/gh/hosts.yml"
+      - test -f /Users/edwardbeech/.config/gh/hosts.yml && echo "gh config visible at the host path" || echo "no gh config at the host path"
+      - test -f /Users/edwardbeech/.config/woodpecker-agent/agent-secret && echo "agent secret host path is readable from a step" || echo "agent secret host path NOT readable from a step"
 
 when:
   - event: push
