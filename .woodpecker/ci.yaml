@@ -22,12 +22,14 @@
 # command.go: "execCommands use step.Image as shell"; genCmdByShell accepts sh, bash and zsh, and probes
 # anything else as a posix shell). So `image: docker.io/library/rust:1.99.1` on a Mac step fails with
 # `exec: "docker.io/library/rust:1.99.1": stat ...: no such file or directory`, which is exactly how this
-# workflow failed on its first run. The image is a shell name here, and cargo/rustup/file/otool are host
+# workflow failed on its first run. The image is a shell name here, and cargo/rustup are host
 # tools on icarus, not container ones.
 #
-# Ported from .github/workflows/ci.yml, which this replaces. Both jobs are kept, including the
-# deployment-target assertions, because those are what stop the Intel/Catalina build silently
-# regressing.
+# Ported from .github/workflows/ci.yml, which this replaces, with one job dropped on purpose: the
+# x86_64-apple-darwin / Catalina leg. The Intel promise went into the too-hard basket - the old Intel MacBook
+# never came back up - and a cross-compile that produces a binary nobody can run is a chore, not a guarantee.
+# The leg is in git history with the MACOSX_DEPLOYMENT_TARGET=10.15 and -Werror=unguarded-availability-new
+# settings that made it honest, for the day a working Intel Mac turns up.
 
 labels:
   platform: darwin/arm64
@@ -42,29 +44,6 @@ steps:
       # vmnet.framework replaced by a pure-C stub with real pipes, no hardware and no root required.
       - cargo test --all-features
       - cargo check --all-features
-
-  - name: x86_64-catalina
-    image: bash
-    environment:
-      # 10.15 is the promise this repo makes about Intel Macs, and the flag makes the compiler fail the
-      # build instead of quietly emitting a binary that would crash on Catalina.
-      MACOSX_DEPLOYMENT_TARGET: "10.15"
-      CFLAGS: "-Werror=unguarded-availability-new"
-    commands:
-      - rustup target add x86_64-apple-darwin
-      # --no-run: an x86_64 test binary cannot execute on an arm64 host, so this checks that the test
-      # code compiles for the Intel target, which is the whole point of the job.
-      - cargo test --target x86_64-apple-darwin --features vmnet-mock --no-run
-      - cargo build --release --target x86_64-apple-darwin
-      - file target/x86_64-apple-darwin/release/darwin-vxlan | grep -q 'Mach-O 64-bit executable x86_64'
-      - |
-        MIN_OS=$(otool -l target/x86_64-apple-darwin/release/darwin-vxlan | awk '
-          /LC_BUILD_VERSION/ { in_section=1; next }
-          in_section && /minos/ { print $2; found=1; exit }
-          END { if (!found) exit 1 }
-        ')
-        test "$MIN_OS" = "10.15"
-        echo "Verified x86_64 Mach-O with minimum macOS $MIN_OS"
 
 when:
   - event: push
