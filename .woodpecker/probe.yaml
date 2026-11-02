@@ -1,7 +1,15 @@
-# Throwaway: what the Darwin agent can actually do, and whether a named Woodpecker Secret reaches a step
-# that runs through the LOCAL backend (maclet has no backend set, so every step of a darwin/arm64 workflow
-# is a native command on icarus-2 - there is no pod, which is why backend_options.kubernetes.secrets cannot
-# help here and a named Secret is the only route a Mac-side publish has. Deleted once answered.
+# Throwaway probe (deleted once answered). Two questions block a Mac-side GitHub Release:
+#
+# 1. v3 has no top-level `secrets:` key, and a named Secret reaches a workflow only through a plugin step's
+#    settings: {from_secret: name} (compiler/settings/params.go:179, compiler/convert.go:106). A
+#    plugin-shaped step cannot execute on the local backend, which is what maclet runs. So how can a
+#    darwin/arm64 step get a GitHub token at all?
+# 2. The local backend runs steps as child processes of the agent (pipeline/backend/local/local.go builds
+#    cmd.Env from os.Environ() plus the step's own vars), so anything in maclet's own LaunchServices
+#    environment should be visible to steps. If true, the token can live on the Mac agent and a script step
+#    can use it.
+#
+# Presence and length only - never the value.
 labels:
   platform: darwin/arm64
 
@@ -9,15 +17,17 @@ steps:
   - name: toolchain-inventory
     image: bash
     commands:
-      - uname -sr && pwd && sw_vers 2>/dev/null | tr '\n' ' '
-      - for c in curl jq gh docker python3 git pkgbuild codesign; do
-          if command -v "$c" >/dev/null 2>&1; then printf 'have %s -> %s\n' "$c" "$(command -v "$c")"; else printf 'MISSING %s\n' "$c"; fi
+      - uname -sr && pwd
+      - sw_vers 2>/dev/null | tr '\n' ' '
+      - echo agent-inherited WOODPECKER vars, present only in the agent process, not in the metadata env
+      - env | sed -n 's/^\(WOODPECKER_[A-Z_]*\)=.*/\1/p' | sort
+      - for c in curl jq gh docker python3 git pkgbuild codesign go swiftc make; do
+          if command -v "$c" >/dev/null 2>&1; then printf 'have %s at %s\n' "$c" "$(command -v "$c")";
+          else printf 'MISSING %s\n' "$c"; fi
         done
-      - test -n "${GITHUB_TOKEN:-}" && echo "named secret reached the local backend (len ${#GITHUB_TOKEN})" || echo "named secret did NOT reach the local backend"
-      - env | sed -n 's/^\(WOODPECKER_[A-Z_]*\)=.*/\1/p' | sort | head -12
-
-secrets:
-  - github_token
+      - echo token presence checks, value never printed
+      - env | awk 'BEGIN{a=0;b=0} /^PLUGIN_TOKEN=/{a=1} /^GITHUB_TOKEN=/{b=1} END{print "PLUGIN_TOKEN present", a, "GITHUB_TOKEN present", b}'
+      - env | awk '/^HOME=/{print "HOME line", $0}'
 
 when:
   - event: push
