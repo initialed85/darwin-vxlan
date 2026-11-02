@@ -1,0 +1,24 @@
+# Throwaway: what the Darwin agent can actually do, and whether a named Woodpecker Secret reaches a step
+# that runs through the LOCAL backend (maclet has no backend set, so every step of a darwin/arm64 workflow
+# is a native command on icarus-2 - there is no pod, which is why backend_options.kubernetes.secrets cannot
+# help here and a named Secret is the only route a Mac-side publish has. Deleted once answered.
+labels:
+  platform: darwin/arm64
+
+steps:
+  - name: toolchain-inventory
+    image: bash
+    commands:
+      - uname -sr && pwd && sw_vers 2>/dev/null | tr '\n' ' '
+      - for c in curl jq gh docker python3 git pkgbuild codesign; do
+          if command -v "$c" >/dev/null 2>&1; then printf 'have %s -> %s\n' "$c" "$(command -v "$c")"; else printf 'MISSING %s\n' "$c"; fi
+        done
+      - test -n "${GITHUB_TOKEN:-}" && echo "named secret reached the local backend (len ${#GITHUB_TOKEN})" || echo "named secret did NOT reach the local backend"
+      - env | sed -n 's/^\(WOODPECKER_[A-Z_]*\)=.*/\1/p' | sort | head -12
+
+secrets:
+  - github_token
+
+when:
+  - event: push
+    branch: master
